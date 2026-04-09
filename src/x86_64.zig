@@ -181,11 +181,11 @@ const AssemblyBuilder = struct {
 
     pub fn appendInsnSlice(self: *AssemblyBuilder, insns: []const Instruction) !void {
         for (insns) |insn|
-            try self.array.append(insn);
+            try self.array.append(self.allocator, insn);
     }
 
     pub fn appendInsn(self: *AssemblyBuilder, insn: Instruction) !void {
-        try self.array.append(insn);
+        try self.array.append(self.allocator, insn);
     }
 
     pub fn print(self: *AssemblyBuilder) void {
@@ -238,7 +238,7 @@ const AssemblyBuilder = struct {
 
         pub const MovKind = enum { load, store };
 
-        inline fn emitPush(writer: anytype, reg: Register) !void {
+        inline fn emitPush(writer: *std.Io.Writer, reg: Register) !void {
             if (reg.toOperandSize() == 2)
                 try writer.writeByte(0x66); // 16-bit operand size
             if (reg.isExtendedBase()) {
@@ -247,7 +247,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(0x50 | reg.toInt());
         }
 
-        inline fn emitPop(writer: anytype, reg: Register) !void {
+        inline fn emitPop(writer: *std.Io.Writer, reg: Register) !void {
             if (reg.toOperandSize() == 2)
                 try writer.writeByte(0x66); // 16-bit operand size
             if (reg.isExtendedBase()) {
@@ -256,7 +256,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(0x58 | reg.toInt());
         }
 
-        inline fn emitImm(writer: anytype, op: RegOpcode, reg: Register, value: u32) !void {
+        inline fn emitImm(writer: *std.Io.Writer, op: RegOpcode, reg: Register, value: u32) !void {
             if (reg.toOperandSize() == 2)
                 try writer.writeByte(0x66); // 16-bit operand size
             try writer.writeByte(RexRegisterSingle(reg));
@@ -271,7 +271,7 @@ const AssemblyBuilder = struct {
             }
         }
 
-        inline fn emitCall(writer: anytype, reg: Register) !void {
+        inline fn emitCall(writer: *std.Io.Writer, reg: Register) !void {
             if (reg.toOperandSize() == 2)
                 try writer.writeByte(0x66); // 16-bit operand size
             if (reg.isExtendedBase())
@@ -280,11 +280,11 @@ const AssemblyBuilder = struct {
             try writer.writeByte(ModRM(.direct, @intFromEnum(RegOpcode.call), reg.toInt()));
         }
 
-        inline fn emitRet(writer: anytype) !void {
+        inline fn emitRet(writer: *std.Io.Writer) !void {
             try writer.writeByte(0xC3); // ret
         }
 
-        inline fn emitMov(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMov(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             if (base.toOperandSize() == 2)
@@ -313,7 +313,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovss(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovss(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0xF3); // Scalar single-precision
@@ -344,7 +344,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovsd(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovsd(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0xF2); // Scalar double-precision
@@ -375,7 +375,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovaps(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovaps(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0x0F); // Prefix for SSE2
@@ -405,7 +405,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovapd(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovapd(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0x66); // double-precision
@@ -436,7 +436,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovups(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovups(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0x0F); // Prefix for SSE2
@@ -466,7 +466,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovupd(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovupd(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0x66); // double-precision
@@ -497,7 +497,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        inline fn emitMovdqu(writer: anytype, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
+        inline fn emitMovdqu(writer: *std.Io.Writer, kind: MovKind, r1: Register, r2: Register, disp: ?i32) !void {
             const base = if (kind == .load) r1 else r2;
             const reg = if (kind == .load) r2 else r1;
             try writer.writeByte(0xF3);
@@ -528,7 +528,7 @@ const AssemblyBuilder = struct {
             } else try writer.writeByte(ModRM(.direct, base.toInt(), reg.toInt()));
         }
 
-        pub fn emit(self: Instruction, writer: anytype) !void {
+        pub fn emit(self: Instruction, writer: *std.Io.Writer) !void {
             return switch (self) {
                 .push => |insn| emitPush(writer, insn),
                 .pop => |insn| emitPop(writer, insn),
@@ -624,23 +624,24 @@ const AssemblyBuilder = struct {
     }
 
     pub fn compile(self: *AssemblyBuilder, allocator: std.mem.Allocator) ![]align(std.heap.page_size_min) u8 {
-        var buffer = try std.ArrayListAligned(u8, std.heap.page_size_min).initCapacity(allocator, 128);
-        errdefer buffer.deinit();
-        const writer = buffer.writer();
+        var writer: std.Io.Writer.Allocating = .init(allocator);
+        defer writer.deinit();
         var last_pos: usize = 0;
         for (self.array.items) |insn| {
-            try insn.emit(writer);
-            const slice = buffer.items[last_pos..];
-            last_pos = buffer.items.len;
+            try insn.emit(&writer.writer);
+            const slice = writer.written()[last_pos..];
+            last_pos = writer.written().len;
             if (comptime build_cfg.verbose_asm) {
                 std.debug.print("{x}\n", .{slice});
             }
         }
-        return try buffer.toOwnedSlice();
+        const slice = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), writer.written().len);
+        @memcpy(slice, writer.written());
+        return slice;
     }
 
     pub fn deinit(self: *AssemblyBuilder) void {
-        self.array.deinit();
+        self.array.deinit(self.allocator);
     }
 };
 

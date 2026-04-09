@@ -24,7 +24,7 @@ pub const ExecutableMemory = struct {
     mem: []align(std.heap.page_size_min) u8,
 
     pub fn init(allocator: std.mem.Allocator, size: usize) !ExecutableMemory {
-        const mem = try allocator.alignedAlloc(u8, std.heap.page_size_min, size);
+        const mem = try allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), size);
         return .{
             .allocator = allocator,
             .mem = mem,

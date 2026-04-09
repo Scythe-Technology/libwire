@@ -19,11 +19,11 @@ fn getenvOwned(alloc: std.mem.Allocator, key: []const u8) ?[]u8 {
 }
 
 const Printer = struct {
-    out: std.fs.File.Writer,
+    out: std.fs.File.DeprecatedWriter,
 
     fn init() Printer {
         return .{
-            .out = std.io.getStdErr().writer(),
+            .out = std.fs.File.stdout().deprecatedWriter(),
         };
     }
 
