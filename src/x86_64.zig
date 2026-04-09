@@ -624,7 +624,7 @@ const AssemblyBuilder = struct {
     }
 
     pub fn compile(self: *AssemblyBuilder, allocator: std.mem.Allocator) ![]align(std.heap.page_size_min) u8 {
-        var writer: std.Io.Writer.Allocating = .init(allocator);
+        var writer: std.Io.Writer.Allocating = try .initCapacity(allocator, 128);
         defer writer.deinit();
         var last_pos: usize = 0;
         for (self.array.items) |insn| {
