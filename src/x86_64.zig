@@ -711,7 +711,7 @@ pub inline fn canFitInArgRegister(class: DataType.Class, size: usize, arg_pos: u
             else => ArgumentRegistery.len,
         }
     else
-        return size <= 16 and arg_pos + @divFloor(size, 8) <= switch (class) {
+        return size <= 16 and arg_pos + (std.math.divCeil(usize, size, 8) catch unreachable) <= switch (class) {
             .sse => FloatingPointRegistery.len,
             else => ArgumentRegistery.len,
         };
