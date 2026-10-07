@@ -38,17 +38,15 @@ jobs:
             name: Windows x86_64
             target: x86_64-windows
             ext: .exe
-          - os: macos-13
-            name: macOs x86_64
+          - os: macos-15-intel
+            name: macOS x86_64
             target: x86_64-macos
-          # Enable when Arm64 is supported
-          # - os: macos-14
-          #   name: macOs Arm64
-          #   target: aarch64-macos
-          #   artifact: zune-${{ needs.prep.outputs.version }}-macos-aarch64
-          # - os: ubuntu-22.04-arm
-          #   name: Linux Arm64
-          #   target: aarch64-linux
+          - os: macos-14
+            name: macOS Arm64
+            target: aarch64-macos
+          - os: ubuntu-22.04-arm
+            name: Linux Arm64
+            target: aarch64-linux
           # Enable when Risc-v64 is supported
           # - os: ubuntu-latest
           #   name: Linux Risc-v64

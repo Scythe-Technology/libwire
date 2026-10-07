@@ -1,15 +1,14 @@
 .{
-    .name = .ffi_asm,
+    .name = .wire,
     .version = "0.0.1",
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
         "LICENSE",
         "README.md",
     },
-    .fingerprint = 0xd2efd6e9592ec086,
+    .fingerprint = 0xb07b393545e86404,
 }

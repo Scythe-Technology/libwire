@@ -1,5 +1,5 @@
 const std = @import("std");
-const ffi = @import("ffi-asm");
+const wire = @import("wire");
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -9,16 +9,17 @@ pub fn main() !void {
         }
     }.inner;
 
-    const mem = try ffi.generateAsmCall(allocator, &.{ ffi.type_i8, ffi.type_i8 }, ffi.type_i8);
-    const dynm = ffi.ExecutableMemory{
-        .allocator = allocator,
-        .mem = mem,
-    };
-    defer dynm.deinit();
+    var pool: wire.mem.Pool = .init(allocator);
+    defer pool.deinit();
 
-    try dynm.executable();
+    const mem = try wire.ffi.prepareCallInfo(
+        allocator,
+        &pool,
+        &.{ .int8, .int8 },
+        .int8,
+    );
 
-    const call_fn_ffi: *const ffi.CallFn = @ptrCast(dynm.mem);
+    const call_fn_ffi: *const wire.ffi.CallFn = @ptrCast(mem.pointer());
 
     var a: i8 = 5;
     var b: i8 = 7;

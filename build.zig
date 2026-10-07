@@ -4,50 +4,30 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const opt_verbose_asm = b.option(bool, "verbose-asm", "Enable verbose assembly output") orelse false;
+    const verbose_asm = b.option(bool, "verbose-asm", "Enable verbose assembly output") orelse false;
+    const test_filter = b.option([]const u8, "test-filter", "filter a test");
+    const llvm = b.option(bool, "llvm", "Enable LLVM backend");
 
     const options = b.addOptions();
 
-    options.addOption(bool, "verbose_asm", opt_verbose_asm);
+    options.addOption(bool, "verbose_asm", verbose_asm);
 
     const options_module = options.createModule();
 
-    const lib = b.addLibrary(.{
-        .linkage = .static,
-        .name = "ffi-asm",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-
-    lib.root_module.addImport("build_cfg", options_module);
-
-    b.installArtifact(lib);
-
-    const module = b.addModule("ffi-asm", .{
+    const mod = b.addModule("root", .{
         .root_source_file = b.path("src/lib.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    module.addImport("build_cfg", options_module);
+    mod.addImport("build_config", options_module);
 
     const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lib.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-        .test_runner = .{
-            .mode = .simple,
-            .path = b.path("runner.zig"),
-        },
-        .filters = b.args orelse &.{},
+        .root_module = mod,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+        .use_llvm = llvm,
+        .use_lld = llvm,
     });
-
-    unit_tests.root_module.addImport("build_cfg", options_module);
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
@@ -66,8 +46,22 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("example/adder.zig"),
         }),
     });
-    example.root_module.addImport("ffi-asm", module);
+    example.root_module.addImport("wire", mod);
     const example_run = b.addRunArtifact(example);
 
     example_step.dependOn(&example_run.step);
+
+    const docs_step = b.step("docs", "Build documentation");
+
+    const docs_obj = b.addObject(.{
+        .name = "docs",
+        .root_module = mod,
+    });
+
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    docs_step.dependOn(&install_docs.step);
 }
