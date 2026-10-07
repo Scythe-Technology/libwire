@@ -47,11 +47,10 @@ jobs:
           - os: ubuntu-22.04-arm
             name: Linux Arm64
             target: aarch64-linux
-          # Enable when Risc-v64 is supported
-          # - os: ubuntu-latest
-          #   name: Linux Risc-v64
-          #   target: riscv64-linux
-          #   qemu-platform: riscv64
+          - os: ubuntu-latest
+            name: Linux Risc-v64
+            target: riscv64-linux
+            qemu-platform: riscv64
 
     name: ${{ matrix.name }}
     timeout-minutes: 20
@@ -72,5 +71,5 @@ jobs:
 
     - name: Run tests
       continue-on-error: ${{ matrix.qemu-platform != '' }}
-      run: zig build test -Dtarget=${{ matrix.target }}${{ matrix.qemu-platform != '' && ' -fqemu' || '' }} --verbose
+      run: zig build test -Dtarget=${{ matrix.target }}${{ matrix.qemu-platform != '' && ' -fqemu' || '' }} --verbose --summary all
 
