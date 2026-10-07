@@ -186,7 +186,7 @@ test "prepareCallInfo and prepareClosureInfo publish into one pool" {
         }
     }.inner;
     const closure = try prepareClosureInfo(allocator, &pool, &.{ .int8, .int8 }, .int8, handler, null);
-    const f: *const fn (i8, i8) callconv(.c) i8 = @ptrCast(closure.pointer());
+    const f: *const fn (i8, i8) callconv(.c) i8 = @ptrCast(@alignCast(closure.pointer()));
     try std.testing.expectEqual(@as(i8, 12), f(5, 7));
     try std.testing.expectEqual(@as(usize, 1), pool.pages.items.len);
 }
