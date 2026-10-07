@@ -367,7 +367,12 @@ pub const WindowsImpl = struct {
             &old,
         )) {
             .SUCCESS => {},
-            .INVALID_ADDRESS, .INVALID_PARAMETER, .ACCESS_DENIED => return error.AccessDenied,
+            .INVALID_ADDRESS,
+            .INVALID_PARAMETER,
+            .ACCESS_DENIED,
+            .CONFLICTING_ADDRESSES,
+            .INVALID_PAGE_PROTECTION,
+            => return error.AccessDenied,
             .INSUFFICIENT_RESOURCES, .NO_MEMORY => return error.OutOfMemory,
             else => |st| return windows.unexpectedStatus(st),
         }
@@ -628,8 +633,11 @@ fn writeRet(buf: []u8) void {
 fn writeAdd(buf: []u8) void {
     switch (comptime native_arch) {
         .x86_64 => {
-            // lea rax, [rdi + rsi]; ret
-            const bytes = [_]u8{ 0x48, 0x8d, 0x04, 0x37, 0xc3 };
+            // lea rax, [arg0 + arg1]; ret. SysV: rdi+rsi. Windows: rcx+rdx.
+            const bytes = switch (comptime native_os) {
+                .windows => [_]u8{ 0x48, 0x8d, 0x04, 0x11, 0xc3 },
+                else => [_]u8{ 0x48, 0x8d, 0x04, 0x37, 0xc3 },
+            };
             @memcpy(buf[0..bytes.len], &bytes);
         },
         .aarch64 => {

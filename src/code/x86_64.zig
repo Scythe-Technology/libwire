@@ -163,8 +163,14 @@ pub fn outgoingBytes(args: []const common.Type, places: []const Place, sret: boo
         }
     }
     if (comptime CallingConvention == .Windows)
-        stack_end = @max(stack_end, 32);
+        stack_end += 32;
     return @intCast(std.mem.Alignment.@"16".forward(stack_end));
+}
+
+/// SystemV: `[rsp]`, Windows: `[rsp+32]`.
+fn outgoingStackDisp(off: usize) i32 {
+    const shadow: usize = if (comptime CallingConvention == .Windows) 32 else 0;
+    return @intCast(off + shadow);
 }
 
 pub const Code = code_body.Code(@This());
@@ -575,14 +581,15 @@ pub const Lower = struct {
             },
             .stack => |off| {
                 const n: usize = if (by_ptr) 1 else @max(eightbytes(arg.type.size), 1);
+                const disp = outgoingStackDisp(off);
                 if (by_ptr) {
                     try self.loadArgPointer(.rax, arg);
-                    try self.assembler.mov(.store, .rsp, .rax, @intCast(off));
+                    try self.assembler.mov(.store, .rsp, .rax, disp);
                     return;
                 }
                 for (0..n) |w| {
                     try self.loadEightbyteToGp(.rax, arg, w);
-                    try self.assembler.mov(.store, .rsp, .rax, @intCast(off + w * 8));
+                    try self.assembler.mov(.store, .rsp, .rax, disp + @as(i32, @intCast(w * 8)));
                 }
             },
         }
@@ -968,15 +975,47 @@ test "code call through param1 noargs is mov r11, rsi" {
     const bytes = try c.compileAlloc(allocator, null);
     defer allocator.free(bytes);
 
-    try std.testing.expectEqualSlices(u8, &.{
-        0x55, // push rbp
-        0x48, 0x89, 0xE5, // mov rbp, rsp
-        0x4C, 0x8B, 0xDE, // mov r11, rsi
-        0x41, 0xFF, 0xD3, // call r11
-        0x48, 0x89, 0xEC, // mov rsp, rbp
-        0x5D, // pop rbp
-        0xC3, // ret
-    }, bytes);
+    // param1 is rsi on SysV and rdx on Windows. A Windows call also reserves
+    // the 32-byte shadow space even when every argument is in a register.
+    const expected: []const u8 = switch (CallingConvention) {
+        .SystemV => &.{
+            0x55, // push rbp
+            0x48, 0x89, 0xE5, // mov rbp, rsp
+            0x4C, 0x8B, 0xDE, // mov r11, rsi
+            0x41, 0xFF, 0xD3, // call r11
+            0x48, 0x89, 0xEC, // mov rsp, rbp
+            0x5D, // pop rbp
+            0xC3, // ret
+        },
+        .Windows => &.{
+            0x55, // push rbp
+            0x48, 0x89, 0xE5, // mov rbp, rsp
+            0x4C, 0x8B, 0xDA, // mov r11, rdx
+            0x48, 0x81, 0xEC, 0x20, 0x00, 0x00, 0x00, // sub rsp, 32
+            0x41, 0xFF, 0xD3, // call r11
+            0x48, 0x81, 0xC4, 0x20, 0x00, 0x00, 0x00, // add rsp, 32
+            0x48, 0x89, 0xEC, // mov rsp, rbp
+            0x5D, // pop rbp
+            0xC3, // ret
+        },
+    };
+    try std.testing.expectEqualSlices(u8, expected, bytes);
+}
+
+test "windows outgoing stack args start after shadow space" {
+    if (comptime CallingConvention != .Windows) return error.SkipZigTest;
+
+    const args: [6]common.Type = @splat(.int64);
+    const places = classify(&args, false);
+    try std.testing.expectEqual(Place{ .gp = 0 }, places[0]);
+    try std.testing.expectEqual(Place{ .gp = 3 }, places[3]);
+    // classify counts from 0. outgoingStackDisp adds the 32-byte home.
+    try std.testing.expectEqual(Place{ .stack = 0 }, places[4]);
+    try std.testing.expectEqual(Place{ .stack = 8 }, places[5]);
+    try std.testing.expectEqual(@as(i32, 32), outgoingStackDisp(0));
+    try std.testing.expectEqual(@as(i32, 40), outgoingStackDisp(8));
+    // 32-byte home plus two 8-byte slots, rounded to 16.
+    try std.testing.expectEqual(@as(u32, 48), outgoingBytes(&args, &places, false));
 }
 
 test "code identity i64" {

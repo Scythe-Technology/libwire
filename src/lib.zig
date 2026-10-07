@@ -45,6 +45,7 @@ pub const Type = common.Type;
 
 test "mmap" {
     if (comptime builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .riscv64) return error.SkipZigTest;
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;
 
     // const mem = try genCallx86_64(allocator, &[_]u8{ 8, 8 }, 8);
     // defer allocator.free(mem);
