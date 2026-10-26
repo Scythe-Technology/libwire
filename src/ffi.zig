@@ -152,7 +152,7 @@ fn publish(
 ) ![]align(mem.BlockAlignment) const u8 {
     const bytes = try code.compileAlloc(allocator, ret);
     defer allocator.free(bytes);
-    return try pool.executable(bytes);
+    return try pool.executable(bytes, false);
 }
 
 pub fn call(call_info: *CallInfo, fn_ptr: *const anyopaque, args: ?[*]const *anyopaque, ret: ?*anyopaque) void {

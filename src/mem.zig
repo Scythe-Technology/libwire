@@ -84,6 +84,7 @@ pub const Pool = struct {
     const Page = struct {
         fixed_allocator: std.heap.FixedBufferAllocator,
         writable: bool = true,
+        locked: bool = false,
     };
 
     pub fn init(gpa: std.mem.Allocator) Pool {
@@ -108,20 +109,25 @@ pub const Pool = struct {
     /// this returns, so the caller never observes a published block whose
     /// page is still writable. The source may be freed immediately. It must
     /// not already live in this pool: the copy would overlap itself.
-    pub fn executable(self: *Pool, bytes: []const u8) ![]align(BlockAlignment) const u8 {
+    ///
+    /// `locked` freezes that page. A later copy will not open it again, which
+    /// is what keeps an already-published block from being made writable.
+    pub fn executable(self: *Pool, bytes: []const u8, locked: bool) ![]align(BlockAlignment) const u8 {
         if (bytes.len == 0) return error.Empty;
         std.debug.assert(!self.contains(bytes.ptr));
 
-        if (try self.place(bytes)) |slice| return slice;
+        if (try self.place(bytes, locked)) |slice| return slice;
 
         const page = try self.addPage(bytes.len);
         const slice = copy(page, bytes) orelse return error.OutOfMemory;
         try seal(page);
+        if (locked) page.locked = true;
         return slice;
     }
 
-    fn place(self: *Pool, bytes: []const u8) !?[]align(BlockAlignment) const u8 {
+    fn place(self: *Pool, bytes: []const u8, locked: bool) !?[]align(BlockAlignment) const u8 {
         for (self.pages.items) |*page| {
+            if (page.locked) continue;
             if (!fits(page, bytes.len)) continue;
 
             // Open before the bump moves. A failed flip must not consume the slot.
@@ -137,6 +143,9 @@ pub const Pool = struct {
                 continue;
             };
             try seal(page);
+            // Lock only after the seal. A failed seal leaves the page open
+            // so a later publish can retry it.
+            if (locked) page.locked = true;
             return slice;
         }
         return null;
@@ -545,7 +554,7 @@ test "Pool executable returns a callable copy" {
     defer pool.deinit();
 
     var src = retBytes();
-    const rx = try pool.executable(&src);
+    const rx = try pool.executable(&src, false);
     try testing.expectEqual(@as(usize, 0), @intFromPtr(rx.ptr) % BlockAlignment);
     try testing.expectEqualSlices(u8, &src, rx);
     try testing.expectEqual(@as(usize, 1), pool.pages.items.len);
@@ -560,8 +569,8 @@ test "Pool second block reseals the first" {
     var pool: Pool = .init(testing.allocator);
     defer pool.deinit();
 
-    const ret_rx = try pool.executable(&retBytes());
-    const add_rx = try pool.executable(&addBytes());
+    const ret_rx = try pool.executable(&retBytes(), false);
+    const add_rx = try pool.executable(&addBytes(), false);
     try testing.expectEqual(@as(usize, 1), pool.pages.items.len);
     try testing.expect(@intFromPtr(ret_rx.ptr) != @intFromPtr(add_rx.ptr));
 
@@ -578,13 +587,13 @@ test "Pool block larger than the tail takes a new page" {
     var pool: Pool = .init(testing.allocator);
     defer pool.deinit();
 
-    const ret_rx = try pool.executable(&retBytes());
+    const ret_rx = try pool.executable(&retBytes(), false);
 
     const big = try testing.allocator.alloc(u8, std.heap.pageSize());
     defer testing.allocator.free(big);
     writeRet(big);
 
-    const big_rx = try pool.executable(big);
+    const big_rx = try pool.executable(big, false);
     try testing.expectEqual(@as(usize, 2), pool.pages.items.len);
 
     const RetFn = *const fn () callconv(.c) void;
@@ -597,7 +606,7 @@ test "Pool block larger than the tail takes a new page" {
 test "Pool deinit unmaps a sealed page" {
     var pool: Pool = .init(testing.allocator);
     errdefer pool.deinit();
-    _ = try pool.executable(&retBytes());
+    _ = try pool.executable(&retBytes(), false);
     try testing.expectEqual(@as(usize, 1), pool.pages.items.len);
     // deinit makes the sealed page writable, then unmaps it.
     pool.deinit();
@@ -606,7 +615,79 @@ test "Pool deinit unmaps a sealed page" {
 test "Pool rejects an empty slice" {
     var pool: Pool = .init(testing.allocator);
     defer pool.deinit();
-    try testing.expectError(error.Empty, pool.executable(""));
+    try testing.expectError(error.Empty, pool.executable("", false));
+    try testing.expectError(error.Empty, pool.executable("", true));
+    try testing.expectEqual(@as(usize, 0), pool.pages.items.len);
+}
+
+test "Pool locked page is not reused" {
+    var pool: Pool = .init(testing.allocator);
+    defer pool.deinit();
+
+    // The first block is a few bytes. Without the lock it would share a page.
+    const ret_rx = try pool.executable(&retBytes(), true);
+    const add_rx = try pool.executable(&addBytes(), false);
+    try testing.expectEqual(@as(usize, 2), pool.pages.items.len);
+    try testing.expect(!samePage(ret_rx.ptr, add_rx.ptr));
+
+    const RetFn = *const fn () callconv(.c) void;
+    const ret_f: RetFn = @ptrCast(ret_rx.ptr);
+    ret_f();
+
+    const AddFn = *const fn (a: i64, b: i64) callconv(.c) i64;
+    const add_f: AddFn = @ptrCast(add_rx.ptr);
+    try testing.expectEqual(@as(i64, 12), add_f(5, 7));
+}
+
+test "Pool lock closes a page that still has room" {
+    var pool: Pool = .init(testing.allocator);
+    defer pool.deinit();
+
+    const first = try pool.executable(&retBytes(), false);
+    const second = try pool.executable(&addBytes(), true);
+    try testing.expectEqual(@as(usize, 1), pool.pages.items.len);
+    try testing.expect(samePage(first.ptr, second.ptr));
+
+    const third = try pool.executable(&retBytes(), false);
+    try testing.expectEqual(@as(usize, 2), pool.pages.items.len);
+    try testing.expect(!samePage(first.ptr, third.ptr));
+
+    const RetFn = *const fn () callconv(.c) void;
+    const first_f: RetFn = @ptrCast(first.ptr);
+    const third_f: RetFn = @ptrCast(third.ptr);
+    first_f();
+    third_f();
+
+    const AddFn = *const fn (a: i64, b: i64) callconv(.c) i64;
+    const second_f: AddFn = @ptrCast(second.ptr);
+    try testing.expectEqual(@as(i64, 12), second_f(5, 7));
+}
+
+test "Pool skips a locked page and fills the open one" {
+    var pool: Pool = .init(testing.allocator);
+    defer pool.deinit();
+
+    const locked = try pool.executable(&retBytes(), true);
+    const open = try pool.executable(&addBytes(), false);
+    const next = try pool.executable(&retBytes(), false);
+    try testing.expectEqual(@as(usize, 2), pool.pages.items.len);
+    try testing.expect(!samePage(locked.ptr, open.ptr));
+    try testing.expect(samePage(open.ptr, next.ptr));
+
+    const RetFn = *const fn () callconv(.c) void;
+    const locked_f: RetFn = @ptrCast(locked.ptr);
+    const next_f: RetFn = @ptrCast(next.ptr);
+    locked_f();
+    next_f();
+
+    const AddFn = *const fn (a: i64, b: i64) callconv(.c) i64;
+    const open_f: AddFn = @ptrCast(open.ptr);
+    try testing.expectEqual(@as(i64, 9), open_f(4, 5));
+}
+
+fn samePage(a: [*]const u8, b: [*]const u8) bool {
+    const page = std.heap.pageSize();
+    return @intFromPtr(a) / page == @intFromPtr(b) / page;
 }
 
 fn retBytes() [4]u8 {
