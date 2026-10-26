@@ -119,7 +119,7 @@ pub fn prepareCallInfo(
     );
     defer code.deinit();
     return .{
-        .buffer = try publish(allocator, pool, &code, null),
+        .buffer = try publish(allocator, pool, &code, null, false),
     };
 }
 
@@ -140,7 +140,7 @@ pub fn prepareClosureInfo(
     );
     defer code.deinit();
     return .{
-        .buffer = try publish(allocator, pool, &code, slot),
+        .buffer = try publish(allocator, pool, &code, slot, true),
     };
 }
 
@@ -149,10 +149,11 @@ fn publish(
     pool: *mem.Pool,
     code: *wire.Code,
     ret: ?wire.Code.Value,
+    locked: bool,
 ) ![]align(mem.BlockAlignment) const u8 {
     const bytes = try code.compileAlloc(allocator, ret);
     defer allocator.free(bytes);
-    return try pool.executable(bytes, false);
+    return try pool.executable(bytes, locked);
 }
 
 pub fn call(call_info: *CallInfo, fn_ptr: *const anyopaque, args: ?[*]const *anyopaque, ret: ?*anyopaque) void {
