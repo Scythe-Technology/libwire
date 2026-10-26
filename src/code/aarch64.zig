@@ -64,8 +64,10 @@ fn returnGpReg(idx: usize) Register {
     };
 }
 
-/// Aggregates larger than 16 bytes are passed and returned by pointer.
+/// An HFA stays in V registers even when it is 24 or 32 bytes. Anything
+/// else larger than 16 bytes, or class `.mem`, is a pointer.
 pub fn needsByPointer(ty: common.Type) bool {
+    if (ty.class == .sse) return false;
     return ty.class == .mem or ty.size > 16;
 }
 
@@ -98,9 +100,9 @@ fn memberCount(ty: common.Type) usize {
 
 fn memberOff(ty: common.Type, i: usize) i32 {
     if (ty.class == .sse and !needsByPointer(ty)) {
-        if (ty.offsets) |offs| {
-            if (i < offs.len) return @intCast(offs[i]);
-        }
+        // Flattened HFAs (`{{f32,f32},{f32,f32}}`) record the nested pair
+        // offsets, which are not the element stride. Count comes from
+        // size/alignment, so the stride is size/count.
         const n = aarch64.hfaFieldCount(ty);
         const step: usize = if (n == 0) 8 else ty.size / n;
         return @intCast(i * step);
@@ -313,23 +315,32 @@ pub const Lower = struct {
         try self.assembler.mov(dest.withBitSize(8), src.withBitSize(8));
     }
 
-    /// ldrb/ldrh/ldr w already zero-extend. A value already in a register
-    /// may have junk above the type, and `Type` has no signedness.
-    fn zeroExtendIfSmall(self: *Lower, reg: Register, ty: common.Type) !void {
-        if (ty.class != .int or ty.size == 0 or ty.size >= 8) return;
-        if (ty.size >= 4) {
+    /// Sizes 1 and 2 have no `uxtb` in this builder, so the byte is stored
+    /// and reloaded. Signed integers reload with `ldrsb`/`ldrsh`; unsigned
+    /// stays `ldrb`/`ldrh`. Size 4 is `mov w, w` (zero-extends). Sizes 3, 5,
+    /// 6, and 7 are one register with a short tail: a 2-byte reload or
+    /// `mov w, w` would clear that tail.
+    fn extendSmall(self: *Lower, reg: Register, ty: common.Type) !void {
+        if (ty.class != .int) return;
+        if (ty.size == 4) {
             const w = reg.withBitSize(4);
             try self.assembler.mov(w, w);
             return;
         }
+        if (ty.size != 1 and ty.size != 2) return;
         const scratch = self.ensureScratch();
-        if (ty.size == 1) {
-            try self.storeAt(fp_reg, scratch, reg, 1);
-            try self.loadAt(reg, fp_reg, scratch, 1);
-        } else {
-            try self.storeAt(fp_reg, scratch, reg, 2);
-            try self.loadAt(reg, fp_reg, scratch, 2);
+        const n: usize = ty.size;
+        try self.storeAt(fp_reg, scratch, reg, n);
+        if (!ty.signed) {
+            try self.loadAt(reg, fp_reg, scratch, n);
+            return;
         }
+        const where = try self.accessBase(fp_reg, scratch, n);
+        const wide = reg.withBitSize(8);
+        if (n == 1)
+            try self.assembler.ldrsb(wide, where[0], where[1])
+        else
+            try self.assembler.ldrsh(wide, where[0], where[1]);
     }
 
     fn spill(self: *Lower, v: ir.VReg) !void {
@@ -389,7 +400,7 @@ pub const Lower = struct {
                         self.slots[v.int()].where = .{ .stack = home };
                     } else {
                         self.bindGp(v, gp_regs[g]);
-                        try self.zeroExtendIfSmall(gp_regs[g], if (by_ptr) .pointer else ty);
+                        try self.extendSmall(gp_regs[g], if (by_ptr) .pointer else ty);
                     }
                 },
                 .fp => |s| {
@@ -586,7 +597,7 @@ pub const Lower = struct {
             return;
         }
         self.bindGp(dst, .x0);
-        try self.zeroExtendIfSmall(.x0, ty);
+        try self.extendSmall(.x0, ty);
     }
 
     fn storeReturnToDisp(self: *Lower, ty: common.Type, d: i32) !void {
@@ -619,6 +630,7 @@ pub const Lower = struct {
         } else {
             try self.takeGp(tmp);
             try self.loadAt(tmp, tmp_ptr, off, @max(ty.size, 1));
+            if (ty.signed and ty.size <= 2) try self.extendSmall(tmp, ty);
             self.bindGp(dst, tmp);
         }
     }
@@ -732,9 +744,12 @@ pub const Lower = struct {
             .gp => |r| {
                 std.debug.assert(word == 0);
                 try self.gpCopy(dest, r);
-                if (word == 0) try self.zeroExtendIfSmall(dest, ty);
+                if (word == 0) try self.extendSmall(dest, ty);
             },
-            .stack => |d| try self.loadAt(dest, fp_reg, d + add, @max(size, 1)),
+            .stack => |d| {
+                try self.loadAt(dest, fp_reg, d + add, @max(size, 1));
+                if (word == 0 and ty.signed and ty.size <= 2) try self.extendSmall(dest, ty);
+            },
             .fp => |r| {
                 std.debug.assert(word == 0);
                 const scratch = self.ensureScratch();
@@ -745,6 +760,7 @@ pub const Lower = struct {
                 std.debug.assert(self.used(v));
                 try self.spill(v);
                 try self.loadAt(dest, fp_reg, self.slots[v.int()].home.? + add, @max(size, 1));
+                if (word == 0 and ty.signed and ty.size <= 2) try self.extendSmall(dest, ty);
             },
         }
     }
@@ -756,6 +772,7 @@ pub const Lower = struct {
                 std.debug.assert(word == 0);
                 try self.takeGp(dest);
                 try self.assembler.mov_imm(dest, bits);
+                try self.extendSmall(dest, arg.type);
             },
             .pointer => |p| {
                 std.debug.assert(word == 0);
@@ -865,23 +882,73 @@ pub const Lower = struct {
         return .{ addr_tmp, 0 };
     }
 
-    fn loadAt(self: *Lower, dest: Register, base: Register, disp: i32, size: usize) EmitError!void {
+    /// x12 is not a user binding. Piece copies of 3/5/6/7 bytes use it, and
+    /// those frame offsets fit a load/store immediate so `accessBase` does
+    /// not also need x12.
+    fn loadGp(self: *Lower, dest: Register, base: Register, disp: i32, size: usize) EmitError!void {
         const where = try self.accessBase(base, disp, size);
         switch (size) {
             1 => try self.assembler.ldrb(dest, where[0], where[1]),
             2 => try self.assembler.ldrh(dest, where[0], where[1]),
-            3...4 => try self.assembler.ldr(dest.withBitSize(4), where[0], where[1]),
+            4 => try self.assembler.ldr(dest.withBitSize(4), where[0], where[1]),
             else => try self.assembler.ldr(dest.withBitSize(8), where[0], where[1]),
         }
     }
 
-    fn storeAt(self: *Lower, base: Register, disp: i32, src: Register, size: usize) EmitError!void {
+    fn storeGp(self: *Lower, base: Register, disp: i32, src: Register, size: usize) EmitError!void {
         const where = try self.accessBase(base, disp, size);
         switch (size) {
             1 => try self.assembler.strb(src, where[0], where[1]),
             2 => try self.assembler.strh(src, where[0], where[1]),
-            3...4 => try self.assembler.str(src.withBitSize(4), where[0], where[1]),
+            4 => try self.assembler.str(src.withBitSize(4), where[0], where[1]),
             else => try self.assembler.str(src.withBitSize(8), where[0], where[1]),
+        }
+    }
+
+    fn xferPieces(
+        self: *Lower,
+        src_base: Register,
+        src_disp: i32,
+        dst_base: Register,
+        dst_disp: i32,
+        size: usize,
+    ) EmitError!void {
+        const piece = addr_tmp;
+        var left = size;
+        var off: usize = 0;
+        while (left > 0) {
+            const n: usize = if (left >= 4) 4 else if (left >= 2) 2 else 1;
+            const s = src_disp + @as(i32, @intCast(off));
+            const d = dst_disp + @as(i32, @intCast(off));
+            try self.loadGp(piece, src_base, s, n);
+            try self.storeGp(dst_base, d, piece, n);
+            off += n;
+            left -= n;
+        }
+    }
+
+    fn loadAt(self: *Lower, dest: Register, base: Register, disp: i32, size: usize) EmitError!void {
+        switch (size) {
+            3, 5, 6, 7 => {
+                const scratch = self.ensureScratch();
+                try self.takeGp(addr_tmp);
+                try self.assembler.mov_imm(addr_tmp, 0);
+                try self.storeGp(fp_reg, scratch, addr_tmp, 8);
+                try self.xferPieces(base, disp, fp_reg, scratch, size);
+                try self.loadGp(dest, fp_reg, scratch, 8);
+            },
+            else => try self.loadGp(dest, base, disp, size),
+        }
+    }
+
+    fn storeAt(self: *Lower, base: Register, disp: i32, src: Register, size: usize) EmitError!void {
+        switch (size) {
+            3, 5, 6, 7 => {
+                const scratch = self.ensureScratch();
+                try self.storeGp(fp_reg, scratch, src, 8);
+                try self.xferPieces(fp_reg, scratch, base, disp, size);
+            },
+            else => try self.storeGp(base, disp, src, size),
         }
     }
 
@@ -1218,4 +1285,146 @@ test "aarch64 code large struct return uses x8" {
     try std.testing.expectEqual(@as(i64, 2), out.b);
     try std.testing.expectEqual(@as(i64, 3), out.c);
     try std.testing.expectEqual(@as(i64, 4), out.d);
+}
+
+test "aarch64 code classify three f64 is an hfa" {
+    const allocator = std.testing.allocator;
+    const ty = try aarch64.createStruct(allocator, &.{ .float64, .float64, .float64 }, null);
+    defer ty.free(allocator);
+    try std.testing.expectEqual(@as(usize, 24), ty.size);
+    try std.testing.expectEqual(common.Type.Class.sse, ty.class);
+    try std.testing.expect(!needsByPointer(ty));
+    try std.testing.expectEqual(@as(usize, 3), aarch64.hfaFieldCount(ty));
+    const places = classify(&.{ty}, false);
+    try std.testing.expectEqual(Place{ .fp = 0 }, places[0]);
+}
+
+test "aarch64 code classify f64 and f32 pair is two gprs" {
+    const allocator = std.testing.allocator;
+    const pair = try aarch64.createStruct(allocator, &.{ .float32, .float32 }, null);
+    defer pair.free(allocator);
+    const ty = try aarch64.createStruct(allocator, &.{ .float64, pair }, null);
+    defer ty.free(allocator);
+    try std.testing.expectEqual(@as(usize, 16), ty.size);
+    try std.testing.expectEqual(common.Type.Class.int, ty.class);
+    try std.testing.expect(!needsByPointer(ty));
+    const places = classify(&.{ty}, false);
+    try std.testing.expectEqual(Place{ .gp = 0 }, places[0]);
+}
+
+test "aarch64 code classify three i64 is a pointer" {
+    const allocator = std.testing.allocator;
+    const ty = try aarch64.createStruct(allocator, &.{ .int64, .int64, .int64 }, null);
+    defer ty.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.mem, ty.class);
+    try std.testing.expect(needsByPointer(ty));
+    const places = classify(&.{ty}, false);
+    try std.testing.expectEqual(Place{ .gp = 0 }, places[0]);
+}
+
+/// `ret` hands x0 back unchanged, so the bits are whatever this caller wrote.
+fn jitRet() !mem.Block {
+    var b = try AssemblyBuilder.initCapacity(std.testing.allocator, 1);
+    defer b.deinit();
+    try b.ret();
+    const bytes = try b.compile(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    return jitFn(bytes);
+}
+
+fn jitStoreByte() !mem.Block {
+    var b = try AssemblyBuilder.initCapacity(std.testing.allocator, 4);
+    defer b.deinit();
+    try b.mov_imm(.w1, 0x5A);
+    try b.strb(.w1, .x0, 0);
+    try b.ret();
+    const bytes = try b.compile(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    return jitFn(bytes);
+}
+
+const aarch64_poison: u64 = 0xDEAD_BEEF_DEAD_BE00;
+
+test "aarch64 code i8 param sign-extends" {
+    try requireAarch64();
+    const allocator = std.testing.allocator;
+    var c = try Code.init(allocator, &.{.int8}, .int64);
+    defer c.deinit();
+    const bytes = try c.compileAlloc(allocator, c.param(0));
+    defer allocator.free(bytes);
+    const dynm = try jitFn(bytes);
+    defer dynm.deinit();
+    const f: *const fn (u64) callconv(.c) u64 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(~@as(u64, 0), f(aarch64_poison | 0xFF));
+}
+
+test "aarch64 code uint8 param zero-extends" {
+    try requireAarch64();
+    const allocator = std.testing.allocator;
+    var c = try Code.init(allocator, &.{.uint8}, .int64);
+    defer c.deinit();
+    const bytes = try c.compileAlloc(allocator, c.param(0));
+    defer allocator.free(bytes);
+    const dynm = try jitFn(bytes);
+    defer dynm.deinit();
+    const f: *const fn (u64) callconv(.c) u64 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(u64, 200), f(aarch64_poison | 200));
+}
+
+test "aarch64 code i8 immediate sign-extends into callee" {
+    try requireAarch64();
+    const allocator = std.testing.allocator;
+    const stub = try jitRet();
+    defer stub.deinit();
+    var c = try Code.init(allocator, &.{}, .int64);
+    defer c.deinit();
+    const r = (try c.call(.imm(@ptrCast(stub.buffer.ptr)), &.{.imm(.int8, 0xFF)}, .int64)).?;
+    const bytes = try c.compileAlloc(allocator, r);
+    defer allocator.free(bytes);
+    const dynm = try jitFn(bytes);
+    defer dynm.deinit();
+    const f: *const fn () callconv(.c) u64 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(~@as(u64, 0), f());
+}
+
+test "aarch64 code uint8 immediate zero-extends into callee" {
+    try requireAarch64();
+    const allocator = std.testing.allocator;
+    const stub = try jitRet();
+    defer stub.deinit();
+    var c = try Code.init(allocator, &.{}, .int64);
+    defer c.deinit();
+    const r = (try c.call(.imm(@ptrCast(stub.buffer.ptr)), &.{.imm(.uint8, 200)}, .int64)).?;
+    const bytes = try c.compileAlloc(allocator, r);
+    defer allocator.free(bytes);
+    const dynm = try jitFn(bytes);
+    defer dynm.deinit();
+    const f: *const fn () callconv(.c) u64 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(u64, 200), f());
+}
+
+test "aarch64 code by-pointer aggregate is a copy" {
+    try requireAarch64();
+    const allocator = std.testing.allocator;
+    const stub = try jitStoreByte();
+    defer stub.deinit();
+    const ty = try aarch64.createStruct(allocator, &.{ .int64, .int64, .int64 }, null);
+    defer ty.free(allocator);
+    try std.testing.expect(needsByPointer(ty));
+
+    var c = try Code.init(allocator, &.{.pointer}, .uint8);
+    defer c.deinit();
+    const arg = try c.loadCallArg(c.param(0), 0, ty);
+    _ = try c.call(.imm(@ptrCast(stub.buffer.ptr)), &.{arg}, .void);
+    const wrote = try c.load(arg, 0, .uint8);
+
+    const bytes = try c.compileAlloc(allocator, wrote);
+    defer allocator.free(bytes);
+    const dynm = try jitFn(bytes);
+    defer dynm.deinit();
+    const f: *const fn (*[24]u8) callconv(.c) u8 = @ptrCast(dynm.buffer);
+    var src: [24]u8 align(8) = @splat(0x11);
+    try std.testing.expectEqual(@as(u8, 0x5A), f(&src));
+    const want: [24]u8 = @splat(0x11);
+    try std.testing.expectEqualSlices(u8, &want, &src);
 }

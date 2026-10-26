@@ -63,11 +63,17 @@ fn eightbytes(size: usize) usize {
     return @divCeil(size, 8);
 }
 
-/// Windows passes aggregates > 8 bytes by address. SysV MEMORY-class
-/// arguments are copied onto the stack (not passed as a hidden pointer).
+/// Windows passes an aggregate in a register only when its size is 1, 2, 4,
+/// or 8. Sizes 3, 5, 6, and 7 are pointers, same as anything larger than 8.
+/// SysV MEMORY-class arguments are copied onto the stack instead.
+fn windowsIndirect(size: usize) bool {
+    return size != 1 and size != 2 and size != 4 and size != 8;
+}
+
 pub fn needsByPointer(ty: common.Type) bool {
     if (comptime CallingConvention != .Windows) return false;
-    return ty.size > 8;
+    if (ty.size == 0) return false;
+    return windowsIndirect(ty.size);
 }
 
 pub fn isMemoryClass(ty: common.Type) bool {
@@ -81,10 +87,10 @@ pub fn isMemoryClass(ty: common.Type) bool {
 pub fn isStructureReturn(ty: common.Type) bool {
     if (ty.size == 0)
         return false;
+    if (comptime CallingConvention == .Windows)
+        return windowsIndirect(ty.size);
     if (ty.class == .mem)
         return true;
-    if (comptime CallingConvention == .Windows)
-        return ty.size > 8;
     return ty.size > 16;
 }
 
@@ -313,23 +319,38 @@ pub const Lower = struct {
         try self.assembler.movzx(dest.withBitSize(8), src.withBitSize(size), null, size);
     }
 
-    fn gpCopySized(self: *Lower, dest: Register, src: Register, size: usize) !void {
+    fn gpCopySized(self: *Lower, dest: Register, src: Register, ty: common.Type, size: usize) !void {
+        if (ty.signed and (size == 1 or size == 2)) {
+            const n: u8 = @intCast(size);
+            try self.assembler.movsx(dest.withBitSize(8), src.withBitSize(n), null, n);
+            return;
+        }
         return switch (size) {
             1, 2 => try self.gpZeroExtend(dest, src, @intCast(size)),
             else => try self.gpCopy(dest, src),
         };
     }
 
-    fn gpLoadSized(self: *Lower, dest: Register, base: Register, disp: i32, size: usize) !void {
+    fn gpLoadSized(self: *Lower, dest: Register, base: Register, disp: i32, ty: common.Type, size: usize) !void {
+        if (ty.signed and (size == 1 or size == 2)) {
+            try self.assembler.movsx(dest.withBitSize(8), base, disp, @intCast(size));
+            return;
+        }
         return switch (size) {
             1, 2 => try self.assembler.movzx(dest.withBitSize(8), base, disp, @intCast(size)),
             else => try self.assembler.mov(.load, dest.withBitSize(8), base, disp),
         };
     }
 
-    fn zeroExtendIfSmall(self: *Lower, reg: Register, ty: common.Type) !void {
-        if (ty.class != .int) return;
-        if (ty.size > 2) return;
+    /// Sizes 1 and 2. `signed` is `movsx`; everything else in that range is
+    /// `movzx`. A 32-bit mov already zero-extends, so size 4 is left alone.
+    fn extendSmall(self: *Lower, reg: Register, ty: common.Type) !void {
+        if (ty.class != .int or ty.size == 0 or ty.size > 2) return;
+        if (ty.signed) {
+            const n: u8 = @intCast(ty.size);
+            try self.assembler.movsx(reg.withBitSize(8), reg.withBitSize(n), null, n);
+            return;
+        }
         try self.gpZeroExtend(reg, reg, @intCast(ty.size));
     }
 
@@ -427,7 +448,7 @@ pub const Lower = struct {
                         self.slots[v.int()].where = .{ .stack = home };
                     } else {
                         self.bindGp(v, gp_regs[g]);
-                        try self.zeroExtendIfSmall(gp_regs[g], ty);
+                        try self.extendSmall(gp_regs[g], ty);
                     }
                 },
                 .sse => |s| {
@@ -454,7 +475,7 @@ pub const Lower = struct {
                             .sse => self.bindSse(v, sse_regs[s.sse]),
                             else => {
                                 self.bindGp(v, gp_regs[s.gp]);
-                                try self.zeroExtendIfSmall(gp_regs[s.gp], ty);
+                                try self.extendSmall(gp_regs[s.gp], ty);
                             },
                         }
                     } else {
@@ -663,7 +684,7 @@ pub const Lower = struct {
             return;
         }
         self.bindGp(dst, .rax);
-        try self.zeroExtendIfSmall(.rax, ty);
+        try self.extendSmall(.rax, ty);
     }
 
     fn storeReturnToDisp(self: *Lower, ty: common.Type, d: i32) !void {
@@ -713,6 +734,7 @@ pub const Lower = struct {
         } else {
             try self.takeGp(.rax);
             try self.loadSized(.rax, .r10, off, @max(ty.size, 1));
+            try self.extendSmall(.rax, ty);
             self.bindGp(dst, .rax);
         }
     }
@@ -800,9 +822,9 @@ pub const Lower = struct {
         switch (self.slots[v.int()].where) {
             .gp => |r| {
                 std.debug.assert(word == 0);
-                try self.gpCopySized(dest, r, size);
+                try self.gpCopySized(dest, r, self.slots[v.int()].type, size);
             },
-            .stack => |d| try self.gpLoadSized(dest, .rbp, d + add, size),
+            .stack => |d| try self.gpLoadSized(dest, .rbp, d + add, self.slots[v.int()].type, size),
             .sse => |r| {
                 std.debug.assert(word == 0);
                 const scratch = self.ensureScratch();
@@ -816,7 +838,7 @@ pub const Lower = struct {
                 // Dead unused vreg should never be loaded.
                 std.debug.assert(self.used(v));
                 try self.spill(v);
-                try self.gpLoadSized(dest, .rbp, self.slots[v.int()].home.? + add, size);
+                try self.gpLoadSized(dest, .rbp, self.slots[v.int()].home.? + add, self.slots[v.int()].type, size);
             },
         }
     }
@@ -827,6 +849,7 @@ pub const Lower = struct {
             .immediate => |bits| {
                 std.debug.assert(word == 0);
                 try self.assembler.mov_imm(dest, bits);
+                try self.extendSmall(dest, arg.type);
             },
             .pointer => |p| {
                 std.debug.assert(word == 0);
@@ -868,6 +891,9 @@ pub const Lower = struct {
                 },
             },
             .immediate => |bits| {
+                // The integer result of the previous call may still be in rax.
+                // Spill it before the float bits reuse that register.
+                try self.takeGp(.rax);
                 try self.assembler.mov_imm(.rax, bits);
                 const scratch = self.ensureScratch();
                 try self.assembler.mov(.store, .rbp, .rax, scratch);
@@ -939,10 +965,67 @@ pub const Lower = struct {
         }
     }
 
+    /// r11 is the callee, so a copy during argument marshalling prefers r10
+    /// and rax. Overwriting the scratch home is fine: it is not a user object.
+    fn pieceReg(a: Register, b: Register) Register {
+        const aa = a.withBitSize(8);
+        const bb = b.withBitSize(8);
+        if (aa != .r10 and bb != .r10) return .r10;
+        if (aa != .rax and bb != .rax) return .rax;
+        return .r11;
+    }
+
+    fn xferPieces(
+        self: *Lower,
+        src_base: Register,
+        src_disp: i32,
+        dst_base: Register,
+        dst_disp: i32,
+        size: usize,
+        piece: Register,
+    ) !void {
+        // The caller names the temp. Picking r10 here drops a user pointer
+        // that copyRefToMem keeps in r10 across an odd-sized load.
+        std.debug.assert(piece.withBitSize(8) != src_base.withBitSize(8));
+        std.debug.assert(piece.withBitSize(8) != dst_base.withBitSize(8));
+        try self.takeGp(piece);
+        var left = size;
+        var off: usize = 0;
+        while (left > 0) {
+            const n: usize = if (left >= 4) 4 else if (left >= 2) 2 else 1;
+            const s = src_disp + @as(i32, @intCast(off));
+            const d = dst_disp + @as(i32, @intCast(off));
+            switch (n) {
+                1, 2 => try self.assembler.movzx(piece.withBitSize(8), src_base, s, @intCast(n)),
+                else => try self.assembler.mov(.load, piece.withBitSize(4), src_base, s),
+            }
+            switch (n) {
+                1 => try self.assembler.mov(.store, dst_base, piece.withBitSize(1), d),
+                2 => try self.assembler.mov(.store, dst_base, piece.withBitSize(2), d),
+                else => try self.assembler.mov(.store, dst_base, piece.withBitSize(4), d),
+            }
+            off += n;
+            left -= n;
+        }
+    }
+
     fn loadSized(self: *Lower, dest: Register, base: Register, disp: i32, size: usize) !void {
         switch (size) {
             1, 2 => try self.assembler.movzx(dest.withBitSize(8), base, disp, @intCast(size)),
-            3...4 => try self.assembler.mov(.load, dest.withBitSize(4), base, disp),
+            4 => try self.assembler.mov(.load, dest.withBitSize(4), base, disp),
+            8 => try self.assembler.mov(.load, dest.withBitSize(8), base, disp),
+            3, 5, 6, 7 => {
+                // A 4-byte or 8-byte mov would read past the object. Stage the
+                // exact bytes in the scratch home, then load that. Only
+                // `dest` may be clobbered: the store address lives in r10.
+                const scratch = self.ensureScratch();
+                std.debug.assert(base.withBitSize(8) != dest.withBitSize(8));
+                try self.takeGp(dest);
+                try self.assembler.mov_imm(dest, 0);
+                try self.assembler.mov(.store, .rbp, dest.withBitSize(8), scratch);
+                try self.xferPieces(base, disp, .rbp, scratch, size, dest);
+                try self.assembler.mov(.load, dest.withBitSize(8), .rbp, scratch);
+            },
             else => try self.assembler.mov(.load, dest.withBitSize(8), base, disp),
         }
     }
@@ -951,7 +1034,17 @@ pub const Lower = struct {
         switch (size) {
             1 => try self.assembler.mov(.store, base, src.withBitSize(1), disp),
             2 => try self.assembler.mov(.store, base, src.withBitSize(2), disp),
-            3...4 => try self.assembler.mov(.store, base, src.withBitSize(4), disp),
+            4 => try self.assembler.mov(.store, base, src.withBitSize(4), disp),
+            8 => try self.assembler.mov(.store, base, src.withBitSize(8), disp),
+            3, 5, 6, 7 => {
+                // Park the register first. The piece temp may be `src`, and
+                // the user's buffer must not receive the bytes past `size`.
+                // `base` stays intact: it is the pointer just loaded into r10.
+                const scratch = self.ensureScratch();
+                try self.assembler.mov(.store, .rbp, src.withBitSize(8), scratch);
+                const piece = pieceReg(.rbp, base);
+                try self.xferPieces(.rbp, scratch, base, disp, size, piece);
+            },
             else => try self.assembler.mov(.store, base, src.withBitSize(8), disp),
         }
     }
@@ -1902,4 +1995,152 @@ test "code u16 load after dirty rax zero-extends into next arg" {
 
     const f: *const fn () callconv(.c) i32 = @ptrCast(dynm.buffer);
     try std.testing.expectEqual(@as(i32, u16_low), f());
+}
+
+fn jitReturnLow(bits: u64) !mem.Block {
+    var b = try AssemblyBuilder.initCapacity(std.testing.allocator, 4);
+    defer b.deinit();
+    try b.mov_imm(.rax, bits);
+    try b.ret();
+    const bytes = try b.compile(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    return jitFn(bytes);
+}
+
+test "code i8 param return sign-extends" {
+    const allocator = std.testing.allocator;
+    var c = try Code.init(allocator, &.{.int8}, .int32);
+    defer c.deinit();
+
+    const dynm = try execCode(&c, c.param(0));
+    defer dynm.deinit();
+
+    const f: *const fn (u64) callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, -1), f(u8_poison | 0xFF));
+}
+
+test "code i16 param return sign-extends" {
+    const allocator = std.testing.allocator;
+    var c = try Code.init(allocator, &.{.int16}, .int32);
+    defer c.deinit();
+
+    const dynm = try execCode(&c, c.param(0));
+    defer dynm.deinit();
+
+    const f: *const fn (u64) callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, -2), f(u8_poison | 0xFFFE));
+}
+
+test "code u8 200 param return zero-extends" {
+    const allocator = std.testing.allocator;
+    var c = try Code.init(allocator, &.{.uint8}, .int32);
+    defer c.deinit();
+
+    const dynm = try execCode(&c, c.param(0));
+    defer dynm.deinit();
+
+    const f: *const fn (u64) callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, 200), f(u8_poison | 200));
+}
+
+test "code i8 return sign-extends into next arg" {
+    const allocator = std.testing.allocator;
+    const stub = try jitReturnLow(0xFF);
+    defer stub.deinit();
+    const widen = try jitWidenFirstGp();
+    defer widen.deinit();
+
+    var c = try Code.init(allocator, &.{}, .int32);
+    defer c.deinit();
+
+    const v = (try c.call(.imm(@ptrCast(stub.buffer.ptr)), &.{}, .int8)).?;
+    const r = try c.call(.imm(@ptrCast(widen.buffer.ptr)), &.{v}, .int32);
+
+    const dynm = try execCode(&c, r);
+    defer dynm.deinit();
+
+    const f: *const fn () callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, -1), f());
+}
+
+test "code u8 200 return zero-extends into next arg" {
+    const allocator = std.testing.allocator;
+    const stub = try jitReturnLow(200);
+    defer stub.deinit();
+    const widen = try jitWidenFirstGp();
+    defer widen.deinit();
+
+    var c = try Code.init(allocator, &.{}, .int32);
+    defer c.deinit();
+
+    const v = (try c.call(.imm(@ptrCast(stub.buffer.ptr)), &.{}, .uint8)).?;
+    const r = try c.call(.imm(@ptrCast(widen.buffer.ptr)), &.{v}, .int32);
+
+    const dynm = try execCode(&c, r);
+    defer dynm.deinit();
+
+    const f: *const fn () callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, 200), f());
+}
+
+test "code i8 immediate sign-extends" {
+    const allocator = std.testing.allocator;
+    const widen = try jitWidenFirstGp();
+    defer widen.deinit();
+
+    var c = try Code.init(allocator, &.{}, .int32);
+    defer c.deinit();
+
+    const r = try c.call(.imm(@ptrCast(widen.buffer.ptr)), &.{.imm(.int8, 0xFF)}, .int32);
+    const dynm = try execCode(&c, r);
+    defer dynm.deinit();
+
+    const f: *const fn () callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, -1), f());
+}
+
+test "code i16 immediate sign-extends" {
+    const allocator = std.testing.allocator;
+    const widen = try jitWidenFirstGp();
+    defer widen.deinit();
+
+    var c = try Code.init(allocator, &.{}, .int32);
+    defer c.deinit();
+
+    const r = try c.call(.imm(@ptrCast(widen.buffer.ptr)), &.{.imm(.int16, 0xFFFE)}, .int32);
+    const dynm = try execCode(&c, r);
+    defer dynm.deinit();
+
+    const f: *const fn () callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, -2), f());
+}
+
+test "code f64 immediate keeps a live i64" {
+    const allocator = std.testing.allocator;
+    const ret42 = struct {
+        fn inner() callconv(.c) i64 {
+            return 42;
+        }
+    }.inner;
+    const pick = struct {
+        fn inner(f: f64, n: i64) callconv(.c) i64 {
+            std.testing.expectEqual(@as(f64, 1.5), f) catch @panic("f");
+            return n;
+        }
+    }.inner;
+
+    var c = try Code.init(allocator, &.{}, .int64);
+    defer c.deinit();
+
+    const n = (try c.call(.imm(@ptrCast(&ret42)), &.{}, .int64)).?;
+    const r = try c.call(.imm(@ptrCast(&pick)), &.{
+        .imm(.float64, @bitCast(@as(f64, 1.5))),
+        n,
+    }, .int64);
+
+    const dynm = try execCode(&c, r);
+    defer dynm.deinit();
+
+    const f: *const fn () callconv(.c) i64 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i64, 42), f());
 }

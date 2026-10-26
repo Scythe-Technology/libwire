@@ -1508,6 +1508,93 @@ test "Test (void) struct(i64, i64)" {
     try testing.expectEqual(222, ret.b);
 }
 
+/// A store wider than the object paints `0xAA` past it. Sizes 3, 5, 6, and
+/// 7 are one register with a short tail (2+1, 4+1, 4+2, 4+2+1). Size 11 is
+/// the high register's 3-byte tail. Windows passes these by hidden pointer;
+/// a register return leaves the buffer filled with the sentinel.
+fn expectOddReturn(comptime n: usize) !void {
+    const Bytes = extern struct { bytes: [n]u8 };
+    const ty = Type.array(.uint8, n);
+    try testing.expectEqual(n, ty.size);
+    try testing.expectEqual(@sizeOf(Bytes), ty.size);
+
+    const Test = struct {
+        fn inner() callconv(.c) Bytes {
+            var out: Bytes = undefined;
+            for (&out.bytes, 0..) |*b, i| b.* = @intCast(i + 1);
+            return out;
+        }
+    }.inner;
+
+    const allocator = testing.allocator;
+    var code = try ffi.buildCallInvoker(allocator, &.{}, ty);
+    defer code.deinit();
+
+    const bytes = try code.compileAlloc(allocator, null);
+    defer allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    defer dynm.deinit();
+    try dynm.executable();
+
+    const call_fn: *const ffi.CallFn = @ptrCast(dynm.buffer);
+
+    var buf: [n + 8]u8 align(8) = @splat(0xAA);
+    call_fn(@ptrCast(&Test), null, &buf);
+
+    for (0..n) |i| try testing.expectEqual(@as(u8, @intCast(i + 1)), buf[i]);
+    for (buf[n..]) |b| try testing.expectEqual(@as(u8, 0xAA), b);
+}
+
+test "Test (void) struct(3) leaves the next byte" {
+    try expectOddReturn(3);
+}
+
+test "Test (void) struct(5) leaves the next byte" {
+    try expectOddReturn(5);
+}
+
+test "Test (void) struct(6) leaves the next byte" {
+    try expectOddReturn(6);
+}
+
+test "Test (void) struct(7) leaves the next byte" {
+    try expectOddReturn(7);
+}
+
+test "Test (void) struct(11) leaves the next byte" {
+    try expectOddReturn(11);
+}
+
+test "Add (struct(3)) i32" {
+    // Size 3 is a pointer on Windows. A register would be dereferenced.
+    const Three = extern struct { a: u8, b: u8, c: u8 };
+    const add = struct {
+        fn inner(s: Three) callconv(.c) i32 {
+            return @as(i32, s.a) + s.b + s.c;
+        }
+    }.inner;
+
+    const ty = Type.array(.uint8, 3);
+    try testing.expectEqual(@sizeOf(Three), ty.size);
+
+    const allocator = testing.allocator;
+    var code = try ffi.buildCallInvoker(allocator, &.{ty}, .int32);
+    defer code.deinit();
+
+    const bytes = try code.compileAlloc(allocator, null);
+    defer allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    defer dynm.deinit();
+    try dynm.executable();
+
+    const call_fn: *const ffi.CallFn = @ptrCast(dynm.buffer);
+
+    var arg: Three = .{ .a = 1, .b = 2, .c = 3 };
+    var res: i32 = 0;
+    call_fn(@ptrCast(&add), &.{&arg}, &res);
+    try testing.expectEqual(@as(i32, 6), res);
+}
+
 test "Add (i64, f64, i64, f64) f64" {
     // Verifies that integer and floating-point argument register counters advance independently.
     const allocator = std.testing.allocator;

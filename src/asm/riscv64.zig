@@ -780,15 +780,25 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
     var cursor: usize = 0;
     var alignment: std.mem.Alignment = .@"1";
     var uniform = fields.len > 0;
+
     const elem_size = if (fields.len > 0) fields[0].size else 0;
     const elem_class: common.Type.Class = if (fields.len > 0) fields[0].class else .int;
+
     for (fields, 0..) |field, i| {
         alignment = alignment.max(field.alignment);
         cursor = field.alignment.forward(cursor);
-        if (offsets) |buf| buf[i] = cursor;
+
+        if (offsets) |buf| {
+            buf[i] = cursor;
+        }
+
         cursor += field.size;
-        if (field.class != elem_class or field.size != elem_size) uniform = false;
+
+        if (field.class != elem_class or field.size != elem_size) {
+            uniform = false;
+        }
     }
+
     // LP64D: one or two FP reals, sizes may differ, go in fa registers.
     // A nested aggregate counts as one member and is not flattened.
     if (fields.len == 2 and isFpScalar(fields[0]) and isFpScalar(fields[1])) {
@@ -800,6 +810,7 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
             .record_sizes = fields[0].size != fields[1].size or padded,
         };
     }
+
     // One float and one integer, either order. Class stays `.int` so a
     // caller that only looks at `class` still sees a non-HFA. The eightbyte
     // slots are the member classes, which the lowerer uses to pick fa+a.
@@ -820,6 +831,7 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
         }
     }
     const hfa = uniform and fields.len >= 1 and fields.len <= 2 and elem_class == .sse;
+
     return .{
         .cursor = cursor,
         .alignment = alignment,
@@ -828,17 +840,19 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
 }
 
 pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
-    if (fields.len == 0)
-        return .{ .size = 0, .alignment = .@"1" };
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
     const offsets = try allocator.alloc(usize, fields.len);
     errdefer allocator.free(offsets);
+
     const layout = layoutFields(fields, offsets);
     if (force_alignment) |forced| {
-        if (forced.compare(.lt, layout.alignment))
-            return error.PoorAlignment;
+        if (forced.compare(.lt, layout.alignment)) return error.PoorAlignment;
     }
+
     const result_align = force_alignment orelse layout.alignment;
     const size = result_align.forward(layout.cursor);
+
     // Larger than two XLEN words: the pointer is passed, not the bytes.
     // FPCC field sizes are meaningless once the argument is a pointer.
     const by_ref = size > 16;
@@ -847,6 +861,7 @@ pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, f
         for (fields, 0..) |field, i| sizes[i] = field.size;
         break :blk sizes;
     } else null;
+
     return .{
         .size = size,
         .alignment = result_align,
@@ -861,8 +876,8 @@ pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, f
 /// the FP count as size/alignment, which is 1 for a scalar and 2 for `[2]f32`.
 /// A ratio above 2 is integer (or memory, once the bytes exceed 16).
 pub fn createArray(@"type": common.Type, amt: usize) common.Type {
-    if (amt == 0)
-        return .{ .size = 0, .alignment = .@"1" };
+    if (amt == 0) return .{ .size = 0, .alignment = .@"1" };
+
     var cursor: usize = 0;
     var alignment: std.mem.Alignment = .@"1";
     for (0..amt) |_| {
@@ -870,10 +885,12 @@ pub fn createArray(@"type": common.Type, amt: usize) common.Type {
         cursor = @"type".alignment.forward(cursor);
         cursor += @"type".size;
     }
+
     const size = alignment.forward(cursor);
     const step = alignment.toByteUnits();
     const ratio = if (step != 0 and size % step == 0) size / step else 0;
     const hfa = @"type".class == .sse and ratio >= 1 and ratio <= 2;
+
     return .{
         .size = size,
         .alignment = alignment,

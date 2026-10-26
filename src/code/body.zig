@@ -129,7 +129,13 @@ pub fn Code(comptime Backend: type) type {
         }
 
         pub fn loadCallArg(self: *Self, ptr: Value, byte_off: i32, ty: common.Type) !Value {
-            if (Backend.needsByPointer(ty)) return ptr;
+            if (Backend.needsByPointer(ty)) {
+                // Win64, AAPCS64, and LP64D pass the aggregate by pointer and
+                // the callee may write it. Handing over the caller's pointer
+                // would publish that write. Copy, then pass the copy.
+                const copied = try self.load(ptr, byte_off, ty);
+                return try self.addrOf(copied);
+            }
             return try self.load(ptr, byte_off, ty);
         }
 

@@ -475,3 +475,47 @@ test "closure is callable through buildCallInvoker" {
     call_fn(@ptrCast(clos_mem.buffer), &.{ &a, &b }, &res);
     try std.testing.expectEqual(@as(i8, 12), res);
 }
+
+test "closure i8 return sign-extends to i32" {
+    // The handler writes one byte. The trampoline is the C callee, so it
+    // has to sign-extend that byte before the caller reads a full i32.
+    const allocator = std.testing.allocator;
+    const handler = struct {
+        fn inner(_: *const anyopaque, _: ?[*]const *anyopaque, ret: ?*anyopaque) callconv(.c) void {
+            closureRet(i8, ret.?).* = -1;
+        }
+    }.inner;
+
+    var code, const slot = try buildClosureInvocator(allocator, &.{}, .int8, handler, null);
+    defer code.deinit();
+
+    const bytes = try code.compileAlloc(allocator, slot);
+    defer allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    defer dynm.deinit();
+    try dynm.executable();
+
+    const f: *const fn () callconv(.c) i32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(i32, -1), f());
+}
+
+test "closure uint8 return zero-extends to u32" {
+    const allocator = std.testing.allocator;
+    const handler = struct {
+        fn inner(_: *const anyopaque, _: ?[*]const *anyopaque, ret: ?*anyopaque) callconv(.c) void {
+            closureRet(u8, ret.?).* = 200;
+        }
+    }.inner;
+
+    var code, const slot = try buildClosureInvocator(allocator, &.{}, .uint8, handler, null);
+    defer code.deinit();
+
+    const bytes = try code.compileAlloc(allocator, slot);
+    defer allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    defer dynm.deinit();
+    try dynm.executable();
+
+    const f: *const fn () callconv(.c) u32 = @ptrCast(dynm.buffer);
+    try std.testing.expectEqual(@as(u32, 200), f());
+}

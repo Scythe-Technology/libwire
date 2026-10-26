@@ -17,6 +17,11 @@ pub const Type = struct {
     /// whose members are not `size / count` (`{f32,f64}` is 4 then 8, with
     /// padding in the gap). `free` releases the slice.
     field_sizes: ?[]const usize = null,
+    /// Signed integer. Only sizes 1 and 2 change codegen: the C caller
+    /// sign-extends those into the register. Size 4 stays a 32-bit move
+    /// (the upper half is zero on x86). RISC-V `lw` sign-extends both
+    /// `i32` and `u32`, so size 4 does not consult this flag.
+    signed: bool = false,
 
     pub const Class = enum { sse, int, mem };
 
@@ -49,14 +54,14 @@ pub const Type = struct {
     }
 
     pub const @"void": Type = .{ .size = 0, .alignment = .@"1" };
-    pub const int8: Type = .{ .size = 1, .alignment = .@"1" };
-    pub const int16: Type = .{ .size = 2, .alignment = .@"2" };
-    pub const int32: Type = .{ .size = 4, .alignment = .@"4" };
-    pub const int64: Type = .{ .size = 8, .alignment = .@"8" };
-    pub const uint8: Type = .int8;
-    pub const uint16: Type = .int16;
-    pub const uint32: Type = .int32;
-    pub const uint64: Type = .int64;
+    pub const int8: Type = .{ .size = 1, .alignment = .@"1", .signed = true };
+    pub const int16: Type = .{ .size = 2, .alignment = .@"2", .signed = true };
+    pub const int32: Type = .{ .size = 4, .alignment = .@"4", .signed = true };
+    pub const int64: Type = .{ .size = 8, .alignment = .@"8", .signed = true };
+    pub const uint8: Type = .{ .size = 1, .alignment = .@"1" };
+    pub const uint16: Type = .{ .size = 2, .alignment = .@"2" };
+    pub const uint32: Type = .{ .size = 4, .alignment = .@"4" };
+    pub const uint64: Type = .{ .size = 8, .alignment = .@"8" };
     pub const float32: Type = .{ .size = 4, .alignment = .@"4", .class = .sse };
     pub const float64: Type = .{ .size = 8, .alignment = .@"8", .class = .sse };
     pub const pointer: Type = .{ .size = 8, .alignment = .@"8" };

@@ -927,7 +927,10 @@ fn mergeField(
     offset: usize,
 ) void {
     const end = offset + field.size;
-    if (field.offsets != null) {
+    // An array records eightbytes and leaves `offsets` null. A scalar leaves
+    // both eightbytes `.none`, so it still contributes `class`.
+    const recorded = field.eightbytes.low != .none or field.eightbytes.high != .none;
+    if (field.offsets != null or recorded) {
         const slots = field.eightbytes;
         if (slots.low == .none and slots.high == .none) {
             mergeRange(low, high, offset, end, fieldEightbyte(field));
@@ -954,12 +957,14 @@ fn summaryClass(low: common.Type.Eightbyte, high: common.Type.Eightbyte) common.
 }
 
 pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
-    if (fields.len == 0)
-        return .{ .size = 0, .alignment = .@"1" };
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
     var offset: usize = 0;
     var alignment: std.mem.Alignment = .@"1";
+
     var offsets = try allocator.alloc(usize, fields.len);
     errdefer allocator.free(offsets);
+
     var low: common.Type.Eightbyte = .none;
     var high: common.Type.Eightbyte = .none;
     for (fields, 0..) |field, i| {
@@ -969,28 +974,38 @@ pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, f
         mergeField(&low, &high, field, offset);
         offset += field.size;
     }
+
     if (force_alignment) |forced| {
-        if (forced.compare(.lt, alignment))
-            return error.PoorAlignment;
+        if (forced.compare(.lt, alignment)) return error.PoorAlignment;
     }
+
     const result_align = force_alignment orelse alignment;
     const size = result_align.forward(offset);
     var class: common.Type.Class = undefined;
-    // Windows never passes an aggregate in XMM. SysV passes at most two
-    // eightbytes in registers; anything larger is MEMORY.
-    if (size > if (comptime CallingConvention == .Windows) 8 else 16) {
+
+    // Windows never passes an aggregate in XMM, and only sizes 1, 2, 4, and
+    // 8 stay in a register. SysV passes at most two eightbytes; anything
+    // larger is MEMORY.
+    if (comptime CallingConvention == .Windows) {
+        if (size == 1 or size == 2 or size == 4 or size == 8) {
+            class = .int;
+            low = .int;
+            high = .none;
+        } else {
+            class = .mem;
+            low = .mem;
+            high = .mem;
+        }
+    } else if (size > 16) {
         class = .mem;
         low = .mem;
         high = .mem;
-    } else if (comptime CallingConvention == .Windows) {
-        class = .int;
-        low = .int;
-        high = .none;
     } else {
         if (size <= 8)
             high = .none;
         class = summaryClass(low, high);
     }
+
     return .{
         .size = size,
         .alignment = result_align,
@@ -1018,16 +1033,22 @@ pub fn createArray(@"type": common.Type, amt: usize) common.Type {
     }
     const size = alignment.forward(offset);
     var class: common.Type.Class = undefined;
-    // Windows never passes an aggregate in XMM. SysV passes at most two
-    // eightbytes in registers; anything larger is MEMORY.
-    if (size > if (comptime CallingConvention == .Windows) 8 else 16) {
+    // Same Windows size rule as `createStruct`. SysV keeps at most two
+    // eightbytes in registers.
+    if (comptime CallingConvention == .Windows) {
+        if (size == 1 or size == 2 or size == 4 or size == 8) {
+            class = .int;
+            low = .int;
+            high = .none;
+        } else {
+            class = .mem;
+            low = .mem;
+            high = .mem;
+        }
+    } else if (size > 16) {
         class = .mem;
         low = .mem;
         high = .mem;
-    } else if (comptime CallingConvention == .Windows) {
-        class = .int;
-        low = .int;
-        high = .none;
     } else {
         if (size <= 8)
             high = .none;
@@ -1315,6 +1336,45 @@ test "AssemblyBuilder encodeInto exact-size buffer" {
     try wide.mov_imm(.rax, 1); // 10 bytes
     var nine: [9]u8 = undefined;
     try std.testing.expectError(error.BufferTooSmall, wide.encodeInto(&nine));
+}
+
+test "array of struct(f64, i64) keeps both eightbytes" {
+    // Windows replaces both eightbytes: 16 bytes is not 1, 2, 4, or 8.
+    if (comptime CallingConvention == .Windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const inner = try createStruct(allocator, &.{ .float64, .int64 }, null);
+    defer inner.free(allocator);
+    const arr = createArray(inner, 1);
+    try std.testing.expectEqual(common.Type.Eightbyte.sse, arr.eightbytes.low);
+    try std.testing.expectEqual(common.Type.Eightbyte.int, arr.eightbytes.high);
+
+    // The array has no offset table. Merging it into a parent used to smear
+    // the summary class across both chunks.
+    const wrapped = try createStruct(allocator, &.{arr}, null);
+    defer wrapped.free(allocator);
+    try std.testing.expectEqual(common.Type.Eightbyte.sse, wrapped.eightbytes.low);
+    try std.testing.expectEqual(common.Type.Eightbyte.int, wrapped.eightbytes.high);
+    try std.testing.expectEqual(common.Type.Class.int, wrapped.class);
+}
+
+test "windows 16-byte array of struct(f64, i64) is memory" {
+    if (comptime CallingConvention != .Windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const inner = try createStruct(allocator, &.{ .float64, .int64 }, null);
+    defer inner.free(allocator);
+    const arr = createArray(inner, 1);
+    try std.testing.expectEqual(@as(usize, 16), arr.size);
+    try std.testing.expectEqual(common.Type.Class.mem, arr.class);
+    try std.testing.expectEqual(common.Type.Eightbyte.mem, arr.eightbytes.low);
+    try std.testing.expectEqual(common.Type.Eightbyte.mem, arr.eightbytes.high);
+
+    const wrapped = try createStruct(allocator, &.{arr}, null);
+    defer wrapped.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.mem, wrapped.class);
+    try std.testing.expectEqual(common.Type.Eightbyte.mem, wrapped.eightbytes.low);
+    try std.testing.expectEqual(common.Type.Eightbyte.mem, wrapped.eightbytes.high);
 }
 
 test "AssemblyBuilder compile matches encodeInto" {

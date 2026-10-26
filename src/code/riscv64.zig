@@ -151,9 +151,9 @@ fn fitsI12(imm: i64) bool {
 /// LP64D. `sret` consumes `a0`. An HFA is never split across `fa`, `a`, and
 /// memory. FP-to-GP overflow is not a spill. A float+int pair takes one `fa`
 /// and one `a` when both are free; if either is missing, the pair uses the
-/// integer memory image and that miss does not set `spilled`. Once any part
-/// of an argument lands on the stack, later integer and FP arguments go
-/// entirely to the stack.
+/// integer memory image and that miss does not set `spilled`. A free `fa`
+/// is still used after a spill. Integer arguments, and FP values that do
+/// not fit in `fa`, do not backfill once any part has landed on the stack.
 pub fn classify(args: []const common.Type, sret: bool) [32]Place {
     var places: [32]Place = undefined;
     std.debug.assert(args.len <= places.len);
@@ -177,7 +177,11 @@ pub fn classify(args: []const common.Type, sret: bool) [32]Place {
         }
         if (arg.class == .sse) {
             const n = hfaCount(arg);
-            if (!spilled and fp + n <= fp_regs.len) {
+            // A free `fa` is used even after an earlier argument spilled.
+            // psABI: FP registers are chosen whether or not the integer
+            // registers are exhausted. The `!spilled` gate stays on the
+            // GPR fallback below, so there is still no integer backfill.
+            if (fp + n <= fp_regs.len) {
                 places[i] = .{ .fp = .{ .base = fp, .n = n } };
                 fp += n;
             } else if (!spilled and gp + n <= gp_regs.len) {
@@ -720,7 +724,7 @@ pub const Lower = struct {
             try self.loadFp(.fa0, tmp_ptr, off, @max(ty.size, 1));
             self.bindFp(dst, .fa0);
         } else {
-            try self.loadIntegerWord(tmp, tmp_ptr, off, @max(ty.size, 1));
+            try self.loadIntegerWord(tmp, tmp_ptr, off, @max(ty.size, 1), scalarSigned(ty));
             self.bindGp(dst, tmp);
         }
     }
@@ -862,7 +866,7 @@ pub const Lower = struct {
                         try self.loadSized(dest, fp_reg, disp, 8);
                 } else {
                     const disp = d + @as(i32, @intCast(word * 8));
-                    try self.loadIntegerWordNoTake(dest, fp_reg, disp, wordBytes(ty, word));
+                    try self.loadIntegerWordNoTake(dest, fp_reg, disp, wordBytes(ty, word), scalarSigned(ty));
                 }
             },
             .none => {
@@ -880,7 +884,7 @@ pub const Lower = struct {
         const add = fieldOff(arg.type, field_index);
         switch (arg.ref) {
             .virtual => |v| switch (self.slots[v.int()].where) {
-                .stack => |d| try self.loadIntegerWord(dest, fp_reg, d + add, sz),
+                .stack => |d| try self.loadIntegerWord(dest, fp_reg, d + add, sz, true),
                 else => unreachable,
             },
             else => unreachable,
@@ -1030,21 +1034,42 @@ pub const Lower = struct {
         }
     }
 
-    fn loadIntegerWord(self: *Lower, dest: Register, base: Register, disp: i32, nbytes: usize) !void {
-        try self.takeGp(dest);
-        try self.loadIntegerWordNoTake(dest, base, disp, nbytes);
+    /// Aggregates keep signed `lb`/`lh`. A scalar `uint8` or `uint16` is
+    /// zero-extended. Size 4 stays `lw` for both `i32` and `u32`.
+    fn scalarSigned(ty: common.Type) bool {
+        if (ty.offsets != null or ty.size > 2) return true;
+        return ty.signed;
     }
 
-    /// Signed `lb`/`lh`/`lw`/`ld`. A 3/5/6/7-byte tail is zero-extended pieces
+    fn loadIntegerWord(self: *Lower, dest: Register, base: Register, disp: i32, nbytes: usize, sign: bool) !void {
+        try self.takeGp(dest);
+        try self.loadIntegerWordNoTake(dest, base, disp, nbytes, sign);
+    }
+
+    /// `sign` selects `lb`/`lh` versus `lbu`/`lhu`. Size 4 stays `lw` for
+    /// both `i32` and `u32`. A 3/5/6/7-byte tail is zero-extended pieces
     /// combined with `add` (no `or` on this assembler) then arithmetic-shifted
     /// back. The address is 8-byte aligned, so the 4/2/1 chunks stay aligned.
-    fn loadIntegerWordNoTake(self: *Lower, dest: Register, base: Register, disp: i32, nbytes: usize) !void {
+    fn loadIntegerWordNoTake(self: *Lower, dest: Register, base: Register, disp: i32, nbytes: usize, sign: bool) !void {
         switch (nbytes) {
-            1 => try self.loadSized(dest, base, disp, 1),
-            2 => try self.loadSized(dest, base, disp, 2),
+            1 => try self.loadSizedSigned(dest, base, disp, 1, sign),
+            2 => try self.loadSizedSigned(dest, base, disp, 2, sign),
             4 => try self.loadSized(dest, base, disp, 4),
             8 => try self.loadSized(dest, base, disp, 8),
             3, 5, 6, 7 => try self.packWord(dest, base, disp, nbytes),
+            else => unreachable,
+        }
+    }
+
+    fn loadSizedSigned(self: *Lower, dest: Register, base: Register, disp: i32, size: usize, sign: bool) !void {
+        if (sign) {
+            try self.loadSized(dest, base, disp, size);
+            return;
+        }
+        const where = try self.rawAddr(base, disp, size);
+        switch (size) {
+            1 => try self.assembler.lbu(dest, where[0], where[1]),
+            2 => try self.assembler.lhu(dest, where[0], where[1]),
             else => unreachable,
         }
     }
@@ -1080,11 +1105,23 @@ pub const Lower = struct {
 
     /// ABI integer slots are `sd` of the widened register. A home store uses
     /// the real width so a 4-byte tail does not write past the object.
+    /// `t1` is the usual data temp and is also a legal home for a loaded
+    /// value. Shifting through it (or through `t0`, the destination base)
+    /// drops the store on the wrong address. `t6` is the indirect callee
+    /// and is not a user binding, so it is the fallback. `t2` stays free
+    /// for `storeSized` when the displacement does not fit.
+    fn shiftTemp(src: Register, base: Register) Register {
+        if (tmp != src and tmp != base) return tmp;
+        if (tmp_ptr != src and tmp_ptr != base) return tmp_ptr;
+        if (callee_reg != src and callee_reg != base) return callee_reg;
+        return addr_tmp;
+    }
+
     fn storeRegBytes(self: *Lower, base: Register, disp: i32, src: Register, nbytes: usize) !void {
         switch (nbytes) {
             1, 2, 4, 8 => try self.storeSized(base, disp, src, nbytes),
             else => {
-                const shift_tmp: Register = if (src == tmp) tmp_ptr else tmp;
+                const shift_tmp = shiftTemp(src, base);
                 var left = nbytes;
                 var off: i32 = 0;
                 var bit: u6 = 0;
@@ -1343,6 +1380,15 @@ test "riscv64 code classify sret mixed shifts only gp" {
     try expectPlace(places, 0, .{ .mixed = .{ .gp = 1, .fp = 0 } });
 }
 
+test "riscv64 code classify f64 after nine i64 stays in fa" {
+    var args: [10]common.Type = undefined;
+    @memset(&args, .int64);
+    args[9] = .float64;
+    const places = classify(&args, false);
+    try expectPlace(places, 8, .{ .stack = 0 });
+    try expectPlace(places, 9, .{ .fp = .{ .base = 0, .n = 1 } });
+}
+
 test "riscv64 code classify hfa miss keeps a later fa" {
     const pair: common.Type = .{ .size = 16, .alignment = .@"8", .class = .sse };
     var args: [9]common.Type = undefined;
@@ -1428,4 +1474,70 @@ test "riscv64 code identity i64 runs" {
     const f: *const fn (i64) callconv(.c) i64 = @ptrCast(dynm.buffer);
     try std.testing.expectEqual(@as(i64, 5), f(5));
     try std.testing.expectEqual(@as(i64, -1), f(-1));
+}
+
+fn jitStoreByte() !mem.Block {
+    var b = try rv.AssemblyBuilder.initCapacity(std.testing.allocator, 4);
+    defer b.deinit();
+    try b.li(.a1, 0x5A);
+    try b.sb(.a1, .a0, 0);
+    try b.ret();
+    const bytes = try b.compile(std.testing.allocator);
+    defer std.testing.allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    try dynm.executable();
+    return dynm;
+}
+
+test "riscv64 code by-pointer aggregate is a copy" {
+    try requireRiscv();
+    const allocator = std.testing.allocator;
+    const stub = try jitStoreByte();
+    defer stub.deinit();
+    const ty = try rv.createStruct(allocator, &.{ .int64, .int64, .int64 }, null);
+    defer ty.free(allocator);
+    try std.testing.expect(needsByPointer(ty));
+
+    var c = try Code.init(allocator, &.{.pointer}, .uint8);
+    defer c.deinit();
+    const arg = try c.loadCallArg(c.param(0), 0, ty);
+    _ = try c.call(.imm(@ptrCast(stub.buffer.ptr)), &.{arg}, .void);
+    const wrote = try c.load(arg, 0, .uint8);
+
+    const bytes = try c.compileAlloc(allocator, wrote);
+    defer allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    defer dynm.deinit();
+    try dynm.executable();
+    const f: *const fn (*[24]u8) callconv(.c) u8 = @ptrCast(dynm.buffer);
+    var src: [24]u8 align(8) = @splat(0x11);
+    try std.testing.expectEqual(@as(u8, 0x5A), f(&src));
+    const want: [24]u8 = @splat(0x11);
+    try std.testing.expectEqualSlices(u8, &want, &src);
+}
+
+test "riscv64 code 3-byte load store keeps the pointer" {
+    // The loaded bytes sit in t1 and the destination pointer sits in t0.
+    // Shifting the tail through either register stores to the wrong address.
+    try requireRiscv();
+    const allocator = std.testing.allocator;
+    const ty: common.Type = .{ .size = 3, .alignment = .@"1" };
+    var c = try Code.init(allocator, &.{ .pointer, .pointer }, .void);
+    defer c.deinit();
+    const v = try c.load(c.param(0), 0, ty);
+    try c.store(c.param(1), 0, v);
+
+    const bytes = try c.compileAlloc(allocator, null);
+    defer allocator.free(bytes);
+    const dynm = try mem.Block.initWithBytes(bytes);
+    defer dynm.deinit();
+    try dynm.executable();
+    const f: *const fn (*const [4]u8, *[4]u8) callconv(.c) void = @ptrCast(dynm.buffer);
+
+    var src: [4]u8 align(8) = .{ 1, 2, 3, 0xAA };
+    var dst: [4]u8 align(8) = @splat(0xAA);
+    f(&src, &dst);
+    try std.testing.expectEqualSlices(u8, src[0..3], dst[0..3]);
+    try std.testing.expectEqual(@as(u8, 0xAA), dst[3]);
+    try std.testing.expectEqual(@as(u8, 0xAA), src[3]);
 }

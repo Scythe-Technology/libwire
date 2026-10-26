@@ -174,6 +174,9 @@ pub const AssemblyBuilder = struct {
         ldrb: struct { Register, Register, i32 },
         strh: struct { Register, Register, i32 },
         ldrh: struct { Register, Register, i32 },
+        /// 64-bit sign-extending byte and halfword loads (LDRSB/LDRSH).
+        ldrsb: struct { Register, Register, i32 },
+        ldrsh: struct { Register, Register, i32 },
         str_fp: struct { Register, Register, i32 },
         ldr_fp: struct { Register, Register, i32 },
         mov: struct { Register, Register },
@@ -244,6 +247,25 @@ pub const AssemblyBuilder = struct {
             const rn_i = try addrIndex(rn);
             const word = try memWord(op, size, rt_i, rn_i, offset, fp);
             try writeInsn(writer, word);
+        }
+
+        /// LDRSB/LDRSH into X. `opc` is 10, so the unsigned bases are
+        /// `0x39800000` / `0x79800000` and the unscaled bases are
+        /// `0x38800000` / `0x78800000`.
+        inline fn signedWord(size: u8, rt: u5, rn: u5, offset: i32) !u32 {
+            const unsigned: u32 = if (size == 1) 0x39800000 else 0x79800000;
+            const unscaled: u32 = if (size == 1) 0x38800000 else 0x78800000;
+            if (fitsUnsigned(size, offset)) |imm12|
+                return unsigned | (imm12 << 10) | (@as(u32, rn) << 5) | rt;
+            if (offset < -256 or offset > 255) return error.OffsetOutOfRange;
+            const imm9: u9 = @bitCast(@as(i9, @intCast(offset)));
+            return unscaled | (@as(u32, imm9) << 12) | (@as(u32, rn) << 5) | rt;
+        }
+
+        inline fn emitSignedLoad(writer: *std.Io.Writer, rt: Register, rn: Register, offset: i32, size: u8) !void {
+            const rt_i = try dataIndex(rt);
+            const rn_i = try addrIndex(rn);
+            try writeInsn(writer, try signedWord(size, rt_i, rn_i, offset));
         }
 
         inline fn memWord(op: MemOp, size: u8, rt: u5, rn: u5, offset: i32, fp: bool) !u32 {
@@ -451,6 +473,8 @@ pub const AssemblyBuilder = struct {
                 .ldrb => |i| try emitMemSized(writer, .load, i[0], i[1], i[2], 1, false),
                 .strh => |i| try emitMemSized(writer, .store, i[0], i[1], i[2], 2, false),
                 .ldrh => |i| try emitMemSized(writer, .load, i[0], i[1], i[2], 2, false),
+                .ldrsb => |i| try emitSignedLoad(writer, i[0], i[1], i[2], 1),
+                .ldrsh => |i| try emitSignedLoad(writer, i[0], i[1], i[2], 2),
                 .str_fp => |i| try emitMem(writer, .store, i[0], i[1], i[2], true),
                 .ldr_fp => |i| try emitMem(writer, .load, i[0], i[1], i[2], true),
                 .mov => |i| try emitMov(writer, i[0], i[1]),
@@ -471,7 +495,7 @@ pub const AssemblyBuilder = struct {
 
         pub fn print(self: Instruction) void {
             switch (self) {
-                .str, .ldr, .strb, .ldrb, .strh, .ldrh, .str_fp, .ldr_fp => |i| {
+                .str, .ldr, .strb, .ldrb, .strh, .ldrh, .ldrsb, .ldrsh, .str_fp, .ldr_fp => |i| {
                     std.debug.print("{s} {s}, [{s}, #{d}]\n", .{ @tagName(self), @tagName(i[0]), @tagName(i[1]), i[2] });
                 },
                 .mov, .fmov => |i| std.debug.print("{s} {s}, {s}\n", .{ @tagName(self), @tagName(i[0]), @tagName(i[1]) }),
@@ -526,6 +550,14 @@ pub const AssemblyBuilder = struct {
 
     pub fn ldrh(self: *AssemblyBuilder, rt: Register, rn: Register, offset: i32) !void {
         try self.commit(.{ .ldrh = .{ rt, rn, offset } });
+    }
+
+    pub fn ldrsb(self: *AssemblyBuilder, rt: Register, rn: Register, offset: i32) !void {
+        try self.commit(.{ .ldrsb = .{ rt, rn, offset } });
+    }
+
+    pub fn ldrsh(self: *AssemblyBuilder, rt: Register, rn: Register, offset: i32) !void {
+        try self.commit(.{ .ldrsh = .{ rt, rn, offset } });
     }
 
     pub fn str_fp(self: *AssemblyBuilder, rt: Register, rn: Register, offset: i32) !void {
@@ -674,22 +706,63 @@ const Aggregate = struct {
     class: common.Type.Class,
 };
 
+/// Element size of an HFA base. A nested HFA counts as its elements, so
+/// `{f32,f32}` is two 4-byte members and `{{f32,f32},{f32,f32}}` is four.
+/// `{f64,{f32,f32}}` is not an HFA: the bases are 8 and 4.
+fn hfaStep(ty: common.Type) ?usize {
+    if (ty.class != .sse) return null;
+
+    const step = ty.alignment.toByteUnits();
+    if (step != 4 and step != 8 and step != 16) return null;
+    if (ty.size == 0 or ty.size % step != 0) return null;
+
+    const n = ty.size / step;
+    if (n < 1 or n > 4) return null;
+
+    return step;
+}
+
 fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
     var cursor: usize = 0;
     var alignment: std.mem.Alignment = .@"1";
-    var uniform = fields.len > 0;
-    const elem_size = if (fields.len > 0) fields[0].size else 0;
-    const elem_class: common.Type.Class = if (fields.len > 0) fields[0].class else .int;
+    var hfa_step: ?usize = null;
+    var hfa_count: usize = 0;
+    var hfa_ok = fields.len > 0;
+
     for (fields, 0..) |field, i| {
         alignment = alignment.max(field.alignment);
         cursor = field.alignment.forward(cursor);
-        if (offsets) |buf| buf[i] = cursor;
+
+        if (offsets) |buf| {
+            buf[i] = cursor;
+        }
+
         cursor += field.size;
-        if (field.class != elem_class or field.size != elem_size) uniform = false;
+
+        if (!hfa_ok) continue;
+
+        const step = hfaStep(field) orelse {
+            hfa_ok = false;
+            continue;
+        };
+        if (hfa_step) |want| {
+            if (want != step) {
+                hfa_ok = false;
+            }
+        } else hfa_step = step;
+
+        hfa_count += field.size / step;
+
+        if (hfa_count > 4) {
+            hfa_ok = false;
+        }
     }
-    // Flat HFA: 1–4 members, all the same FP size. Nested aggregates are not
-    // flattened; a field that is already a struct counts as one member.
-    const hfa = uniform and fields.len >= 1 and fields.len <= 4 and elem_class == .sse;
+
+    // Padding between members is not an HFA. The byte count has to be
+    // exactly count * element size.
+    const step = hfa_step orelse 0;
+    const hfa = hfa_ok and step != 0 and hfa_count >= 1 and hfa_count <= 4 and cursor == hfa_count * step;
+
     return .{
         .cursor = cursor,
         .alignment = alignment,
@@ -698,30 +771,40 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
 }
 
 pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
-    if (fields.len == 0)
-        return .{ .size = 0, .alignment = .@"1" };
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
     const offsets = try allocator.alloc(usize, fields.len);
     errdefer allocator.free(offsets);
+
     const layout = layoutFields(fields, offsets);
     if (force_alignment) |forced| {
-        if (forced.compare(.lt, layout.alignment))
-            return error.PoorAlignment;
+        if (forced.compare(.lt, layout.alignment)) return error.PoorAlignment;
     }
+
     const result_align = force_alignment orelse layout.alignment;
     const size = result_align.forward(layout.cursor);
+
+    // An HFA of 3 or 4 doubles is 24 or 32 bytes and still uses V registers.
+    const class: common.Type.Class = if (layout.class == .sse)
+        .sse
+    else if (size > 16)
+        .mem
+    else
+        .int;
+
     return .{
         .size = size,
         .alignment = result_align,
         .offsets = offsets,
-        .class = if (size > 16) .mem else layout.class,
+        .class = class,
     };
 }
 
 /// No offset table: `Type.array` has no allocator. `hfaFieldCount` recovers
 /// an FP array as size/alignment members (a scalar's ratio is 1).
 pub fn createArray(@"type": common.Type, amt: usize) common.Type {
-    if (amt == 0)
-        return .{ .size = 0, .alignment = .@"1" };
+    if (amt == 0) return .{ .size = 0, .alignment = .@"1" };
+
     var cursor: usize = 0;
     var alignment: std.mem.Alignment = .@"1";
     for (0..amt) |_| {
@@ -729,26 +812,31 @@ pub fn createArray(@"type": common.Type, amt: usize) common.Type {
         cursor = @"type".alignment.forward(cursor);
         cursor += @"type".size;
     }
+
     const size = alignment.forward(cursor);
-    const hfa = amt >= 1 and amt <= 4 and @"type".class == .sse;
+
+    // `[3]f64` is 24 bytes and still three D registers. `[5]f32` is not an HFA.
+    const step = hfaStep(@"type");
+    const members: usize = if (step) |s| amt * (@"type".size / s) else 0;
+    const hfa = step != null and members >= 1 and members <= 4 and size == members * step.?;
+    const class: common.Type.Class = if (hfa) .sse else if (size > 16) .mem else .int;
+
     return .{
         .size = size,
         .alignment = alignment,
-        .class = if (size > 16) .mem else if (hfa) .sse else .int,
+        .class = class,
     };
 }
 
-/// FP registers an `.sse` value needs. Structs store one offset per member.
-/// Arrays do not, so a scalar (size == alignment) is one register and
-/// `[N]f32` is N. N > 4 has already been classed `.mem`.
+/// FP registers an `.sse` value needs. Size/alignment wins over `offsets`:
+/// a flattened `{{f32,f32},{f32,f32}}` has two nested offsets and four
+/// elements. A scalar is one register. N > 4 is not class `.sse`.
 pub fn hfaFieldCount(ty: common.Type) usize {
+    if (ty.class == .sse) {
+        if (hfaStep(ty)) |step| return ty.size / step;
+    }
     if (ty.offsets) |offs| {
         if (offs.len > 0) return offs.len;
-    }
-    const step = ty.alignment.toByteUnits();
-    if (ty.class == .sse and step != 0 and ty.size % step == 0) {
-        const n = ty.size / step;
-        if (n >= 1 and n <= 4) return n;
     }
     return 1;
 }
@@ -1142,6 +1230,9 @@ test "aarch64 AssemblyBuilder loads and stores" {
     try code.ldr(.w2, .x3, -4);
     try code.str(.w2, .x3, 1);
     try code.ldrb(.w0, .x1, 3);
+    try code.ldrsb(.x0, .x1, 0);
+    try code.ldrsh(.x2, .x3, 4);
+    try code.ldrsb(.x0, .x1, -1);
     try code.strb(.w4, .x5, 0);
     try code.ldrh(.w2, .x3, 4);
     try code.strh(.w1, .x2, 2);
@@ -1174,6 +1265,9 @@ test "aarch64 AssemblyBuilder loads and stores" {
         0x62, 0xc0, 0x5f, 0xb8, // ldur w2, [x3, #-4]
         0x62, 0x10, 0x00, 0xb8, // stur w2, [x3, #1]
         0x20, 0x0c, 0x40, 0x39, // ldrb w0, [x1, #3]
+        0x20, 0x00, 0x80, 0x39, // ldrsb x0, [x1]
+        0x62, 0x08, 0x80, 0x79, // ldrsh x2, [x3, #4]
+        0x20, 0xf0, 0x9f, 0x38, // ldursb x0, [x1, #-1]
         0xa4, 0x00, 0x00, 0x39, // strb w4, [x5]
         0x62, 0x08, 0x40, 0x79, // ldrh w2, [x3, #4]
         0x41, 0x04, 0x00, 0x79, // strh w1, [x2, #2]
@@ -1274,6 +1368,28 @@ test "aarch64 createStruct and createArray" {
     try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(.float32));
     try std.testing.expectEqual(@as(usize, 4), hfaFieldCount(createArray(.float32, 4)));
     try std.testing.expectEqual(common.Type.Class.mem, createArray(.float32, 5).class);
+
+    const three_f64 = try createStruct(allocator, &.{ .float64, .float64, .float64 }, null);
+    defer three_f64.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.sse, three_f64.class);
+    try std.testing.expectEqual(@as(usize, 24), three_f64.size);
+    try std.testing.expectEqual(@as(usize, 3), hfaFieldCount(three_f64));
+
+    const inner_pair = try createStruct(allocator, &.{ .float32, .float32 }, null);
+    defer inner_pair.free(allocator);
+    const mixed_hfa = try createStruct(allocator, &.{ .float64, inner_pair }, null);
+    defer mixed_hfa.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.int, mixed_hfa.class);
+
+    const flat = try createStruct(allocator, &.{ inner_pair, inner_pair }, null);
+    defer flat.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.sse, flat.class);
+    try std.testing.expectEqual(@as(usize, 4), hfaFieldCount(flat));
+
+    const arr3 = createArray(.float64, 3);
+    try std.testing.expectEqual(common.Type.Class.sse, arr3.class);
+    try std.testing.expectEqual(@as(usize, 24), arr3.size);
+    try std.testing.expectEqual(@as(usize, 3), hfaFieldCount(arr3));
     try std.testing.expectEqual(common.Type.Class.int, createArray(.int32, 4).class);
     try std.testing.expectEqual(@as(usize, 16), createArray(.int32, 4).size);
     try std.testing.expectEqual(@as(usize, 0), createArray(.float64, 0).size);
