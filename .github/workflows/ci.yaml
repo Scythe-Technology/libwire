@@ -20,7 +20,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.17.0
+        version: 0.17.1
         use-cache: false
 
     - name: Run fmt
@@ -41,7 +41,7 @@ jobs:
           - os: macos-15-intel
             name: macOS x86_64
             target: x86_64-macos
-          - os: macos-14
+          - os: macos-26
             name: macOS Arm64
             target: aarch64-macos
           - os: ubuntu-22.04-arm
@@ -62,7 +62,7 @@ jobs:
     - name: Setup Zig
       uses: mlugg/setup-zig@v2
       with:
-        version: 0.17.0
+        version: 0.17.1
         use-cache: false
 
     - name: Setup QEMU
