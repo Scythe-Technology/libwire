@@ -42,13 +42,13 @@ jobs:
             name: macOS x86_64
             target: x86_64-macos
           - os: macos-26
-            name: macOS Arm64
+            name: macOS aarch64
             target: aarch64-macos
           - os: ubuntu-22.04-arm
-            name: Linux Arm64
+            name: Linux aarch64
             target: aarch64-linux
           - os: ubuntu-latest
-            name: Linux Risc-v64
+            name: Linux riscv64
             target: riscv64-linux
             qemu-platform: riscv64
 
