@@ -209,6 +209,7 @@ pub fn mprotect(bytes: []align(std.heap.page_size_min) const u8, prot: PROT) Err
     switch (comptime native_os) {
         .linux => try LinuxImpl.mprotect(addr, len, prot),
         .freebsd => try FreebsdImpl.mprotect(addr, len, prot),
+        .openbsd, .netbsd => try LibcImpl.mprotect(addr, len, prot),
         .windows => try WindowsImpl.mprotect(addr, len, prot),
         .driverkit,
         .ios,
@@ -311,6 +312,23 @@ pub const FreebsdImpl = struct {
         } else {
             @compileError("mem.mprotect: unsupported FreeBSD arch " ++ @tagName(native_arch));
         }
+    }
+};
+
+pub const LibcImpl = struct {
+    fn mprotect(addr: usize, len: usize, prot: PROT) Error!void {
+        const ptr: *align(std.heap.page_size_min) anyopaque = @ptrFromInt(addr);
+        return switch (std.c.errno(std.c.mprotect(ptr, len, .{
+            .READ = prot.READ,
+            .WRITE = prot.WRITE,
+            .EXEC = prot.EXEC,
+        }))) {
+            .SUCCESS => {},
+            .PERM => error.PermissionDenied,
+            .ACCES, .FAULT => error.AccessDenied,
+            .NOMEM => error.OutOfMemory,
+            else => error.Unexpected,
+        };
     }
 };
 

@@ -46,6 +46,8 @@ Pages for executable machine code.
 | --- | --- |
 | Linux | x86_64, aarch64, riscv64 |
 | FreeBSD | x86_64, aarch64, riscv64 |
+| OpenBSD | x86_64, aarch64, riscv64 |
+| NetBSD | x86_64, aarch64, riscv64 |
 | macOS | x86_64, aarch64 |
 | Windows | x86_64 |
 
