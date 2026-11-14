@@ -43,6 +43,25 @@ test {
 
 pub const Type = common.Type;
 
+test "Type.comptimeStruct matches Type.struct without a heap slice" {
+    const ct = Type.comptimeStruct(&.{ .float64, .float64 }, null);
+    const rt = try Type.@"struct"(std.testing.allocator, &.{ .float64, .float64 }, null);
+    defer rt.free(std.testing.allocator);
+    if (ct.offsets) |got|
+        try std.testing.expectEqualSlices(usize, rt.offsets.?, got);
+    if (ct.field_sizes) |got|
+        try std.testing.expectEqualSlices(usize, rt.field_sizes.?, got);
+    try std.testing.expectEqual(rt.size, ct.size);
+    try std.testing.expectEqual(rt.alignment, ct.alignment);
+    try std.testing.expectEqual(rt.class, ct.class);
+    try std.testing.expectEqual(rt.eightbytes.low, ct.eightbytes.low);
+    try std.testing.expectEqual(rt.eightbytes.high, ct.eightbytes.high);
+
+    const forced = Type.comptimeStruct(&.{ .int32, .int32 }, .@"8");
+    try std.testing.expectEqual(@as(usize, 8), forced.size);
+    try std.testing.expectEqual(std.mem.Alignment.@"8", forced.alignment);
+}
+
 test "mmap" {
     if (comptime builtin.cpu.arch == .aarch64 or builtin.cpu.arch == .riscv64) return error.SkipZigTest;
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .macos) return error.SkipZigTest;

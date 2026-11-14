@@ -956,36 +956,29 @@ fn summaryClass(low: common.Type.Eightbyte, high: common.Type.Eightbyte) common.
     return .int;
 }
 
-pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
-    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+const Placed = struct {
+    cursor: usize = 0,
+    alignment: std.mem.Alignment = .@"1",
+    low: common.Type.Eightbyte = .none,
+    high: common.Type.Eightbyte = .none,
 
-    var offset: usize = 0;
-    var alignment: std.mem.Alignment = .@"1";
-
-    var offsets = try allocator.alloc(usize, fields.len);
-    errdefer allocator.free(offsets);
-
-    var low: common.Type.Eightbyte = .none;
-    var high: common.Type.Eightbyte = .none;
-    for (fields, 0..) |field, i| {
-        alignment = alignment.max(field.alignment);
-        offset = field.alignment.forward(offset);
-        offsets[i] = offset;
-        mergeField(&low, &high, field, offset);
-        offset += field.size;
+    fn add(self: *Placed, field: common.Type, index: usize, offsets: ?[]usize) void {
+        self.alignment = self.alignment.max(field.alignment);
+        self.cursor = field.alignment.forward(self.cursor);
+        if (offsets) |buf| {
+            buf[index] = self.cursor;
+        }
+        mergeField(&self.low, &self.high, field, self.cursor);
+        self.cursor += field.size;
     }
+};
 
-    if (force_alignment) |forced| {
-        if (forced.compare(.lt, alignment)) return error.PoorAlignment;
-    }
-
-    const result_align = force_alignment orelse alignment;
-    const size = result_align.forward(offset);
+fn layoutType(placed: Placed, result_align: std.mem.Alignment, offsets: ?[]usize) common.Type {
+    const size = result_align.forward(placed.cursor);
     var class: common.Type.Class = undefined;
+    var low = placed.low;
+    var high = placed.high;
 
-    // Windows never passes an aggregate in XMM, and only sizes 1, 2, 4, and
-    // 8 stay in a register. SysV passes at most two eightbytes; anything
-    // larger is MEMORY.
     if (comptime CallingConvention == .Windows) {
         if (size == 1 or size == 2 or size == 4 or size == 8) {
             class = .int;
@@ -1018,51 +1011,58 @@ pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, f
     };
 }
 
+fn layoutStruct(fields: []const common.Type, force_alignment: ?std.mem.Alignment, offsets: ?[]usize) error{PoorAlignment}!common.Type {
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+    if (offsets) |buf| std.debug.assert(buf.len == fields.len);
+
+    var placed: Placed = .{};
+    for (fields, 0..) |field, i| {
+        placed.add(field, i, offsets);
+    }
+
+    if (force_alignment) |forced| {
+        if (forced.compare(.lt, placed.alignment)) return error.PoorAlignment;
+    }
+
+    return layoutType(placed, force_alignment orelse placed.alignment, offsets);
+}
+
+pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
+    const offsets = try allocator.alloc(usize, fields.len);
+    errdefer allocator.free(offsets);
+
+    return layoutStruct(fields, force_alignment, offsets);
+}
+
+fn fieldAlignment(fields: []const common.Type) std.mem.Alignment {
+    var alignment: std.mem.Alignment = .@"1";
+    for (fields) |field| {
+        alignment = alignment.max(field.alignment);
+    }
+    return alignment;
+}
+
+pub fn comptimeStruct(comptime fields: []const common.Type, comptime force_alignment: ?std.mem.Alignment) common.Type {
+    const natural = comptime fieldAlignment(fields);
+    if (force_alignment) |forced| {
+        if (@backingInt(forced) < @backingInt(natural))
+            @compileError("poor struct alignment");
+    }
+    return comptime (layoutStruct(fields, force_alignment, null) catch unreachable);
+}
+
 pub fn createArray(@"type": common.Type, amt: usize) common.Type {
     if (amt == 0)
         return .{ .size = 0, .alignment = .@"1" };
-    var offset: usize = 0;
-    var alignment: std.mem.Alignment = .@"1";
-    var low: common.Type.Eightbyte = .none;
-    var high: common.Type.Eightbyte = .none;
-    for (0..amt) |_| {
-        alignment = alignment.max(@"type".alignment);
-        offset = @"type".alignment.forward(offset);
-        mergeField(&low, &high, @"type", offset);
-        offset += @"type".size;
+
+    var placed: Placed = .{};
+    for (0..amt) |i| {
+        placed.add(@"type", i, null);
     }
-    const size = alignment.forward(offset);
-    var class: common.Type.Class = undefined;
-    // Same Windows size rule as `createStruct`. SysV keeps at most two
-    // eightbytes in registers.
-    if (comptime CallingConvention == .Windows) {
-        if (size == 1 or size == 2 or size == 4 or size == 8) {
-            class = .int;
-            low = .int;
-            high = .none;
-        } else {
-            class = .mem;
-            low = .mem;
-            high = .mem;
-        }
-    } else if (size > 16) {
-        class = .mem;
-        low = .mem;
-        high = .mem;
-    } else {
-        if (size <= 8)
-            high = .none;
-        class = summaryClass(low, high);
-    }
-    return .{
-        .size = size,
-        .alignment = alignment,
-        .class = class,
-        .eightbytes = .{
-            .low = low,
-            .high = high,
-        },
-    };
+
+    return layoutType(placed, placed.alignment, null);
 }
 
 pub inline fn canFitInArgRegister(class: common.Type.Class, size: usize, arg_pos: usize) bool {
@@ -1375,6 +1375,43 @@ test "windows 16-byte array of struct(f64, i64) is memory" {
     try std.testing.expectEqual(common.Type.Class.mem, wrapped.class);
     try std.testing.expectEqual(common.Type.Eightbyte.mem, wrapped.eightbytes.low);
     try std.testing.expectEqual(common.Type.Eightbyte.mem, wrapped.eightbytes.high);
+}
+
+fn expectComptimeStruct(comptime fields: []const common.Type, comptime force_alignment: ?std.mem.Alignment) !void {
+    const ct = comptimeStruct(fields, force_alignment);
+    const rt = try createStruct(std.testing.allocator, fields, force_alignment);
+    defer rt.free(std.testing.allocator);
+    try std.testing.expect(ct.offsets == null);
+    try std.testing.expect(ct.field_sizes == null);
+    try std.testing.expectEqual(rt.size, ct.size);
+    try std.testing.expectEqual(rt.alignment, ct.alignment);
+    try std.testing.expectEqual(rt.class, ct.class);
+    try std.testing.expectEqual(rt.eightbytes.low, ct.eightbytes.low);
+    try std.testing.expectEqual(rt.eightbytes.high, ct.eightbytes.high);
+    try std.testing.expectEqual(rt.signed, ct.signed);
+}
+
+test "comptimeStruct matches createStruct without a heap slice" {
+    try expectComptimeStruct(&.{}, null);
+    try expectComptimeStruct(&.{ .float32, .float32 }, null);
+    try expectComptimeStruct(&.{ .float32, .float32, .int32, .int32 }, null);
+    try expectComptimeStruct(&.{ .float64, .int64 }, null);
+    try expectComptimeStruct(&.{ .int32, .float64 }, null);
+    try expectComptimeStruct(&.{ .int64, .int64, .int64 }, null);
+    try expectComptimeStruct(&.{ .int32, .int32 }, .@"8");
+    try expectComptimeStruct(&.{ .int8, .int8 }, null);
+
+    // Eightbytes are inline, so a parent merge does not need the offset table.
+    const inner = comptime comptimeStruct(&.{ .float64, .int64 }, null);
+    const wrapped = comptimeStruct(&.{inner}, null);
+    const allocator = std.testing.allocator;
+    const runtime_inner = try createStruct(allocator, &.{ .float64, .int64 }, null);
+    defer runtime_inner.free(allocator);
+    const runtime_wrapped = try createStruct(allocator, &.{runtime_inner}, null);
+    defer runtime_wrapped.free(allocator);
+    try std.testing.expectEqual(runtime_wrapped.eightbytes.low, wrapped.eightbytes.low);
+    try std.testing.expectEqual(runtime_wrapped.eightbytes.high, wrapped.eightbytes.high);
+    try std.testing.expectEqual(runtime_wrapped.class, wrapped.class);
 }
 
 test "AssemblyBuilder compile matches encodeInto" {

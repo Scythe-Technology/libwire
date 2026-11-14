@@ -770,11 +770,11 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
     };
 }
 
-pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
+fn layoutStruct(fields: []const common.Type, force_alignment: ?std.mem.Alignment, offsets: ?[]usize) error{PoorAlignment}!common.Type {
     if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
-
-    const offsets = try allocator.alloc(usize, fields.len);
-    errdefer allocator.free(offsets);
+    if (offsets) |buf| {
+        std.debug.assert(buf.len == fields.len);
+    }
 
     const layout = layoutFields(fields, offsets);
     if (force_alignment) |forced| {
@@ -798,6 +798,31 @@ pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, f
         .offsets = offsets,
         .class = class,
     };
+}
+
+pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
+    const offsets = try allocator.alloc(usize, fields.len);
+    errdefer allocator.free(offsets);
+    return layoutStruct(fields, force_alignment, offsets);
+}
+
+fn fieldAlignment(fields: []const common.Type) std.mem.Alignment {
+    var alignment: std.mem.Alignment = .@"1";
+    for (fields) |field| {
+        alignment = alignment.max(field.alignment);
+    }
+    return alignment;
+}
+
+pub fn comptimeStruct(comptime fields: []const common.Type, comptime force_alignment: ?std.mem.Alignment) common.Type {
+    const natural = comptime fieldAlignment(fields);
+    if (force_alignment) |forced| {
+        if (@backingInt(forced) < @backingInt(natural))
+            @compileError("poor struct alignment");
+    }
+    return comptime (layoutStruct(fields, force_alignment, null) catch unreachable);
 }
 
 /// No offset table: `Type.array` has no allocator. `hfaFieldCount` recovers
@@ -1393,6 +1418,38 @@ test "aarch64 createStruct and createArray" {
     try std.testing.expectEqual(common.Type.Class.int, createArray(.int32, 4).class);
     try std.testing.expectEqual(@as(usize, 16), createArray(.int32, 4).size);
     try std.testing.expectEqual(@as(usize, 0), createArray(.float64, 0).size);
+}
+
+fn expectComptimeStruct(comptime fields: []const common.Type, comptime force_alignment: ?std.mem.Alignment) !void {
+    const ct = comptimeStruct(fields, force_alignment);
+    const rt = try createStruct(std.testing.allocator, fields, force_alignment);
+    defer rt.free(std.testing.allocator);
+    try std.testing.expect(ct.offsets == null);
+    try std.testing.expect(ct.field_sizes == null);
+    try std.testing.expectEqual(rt.size, ct.size);
+    try std.testing.expectEqual(rt.alignment, ct.alignment);
+    try std.testing.expectEqual(rt.class, ct.class);
+    if (ct.class == .sse)
+        try std.testing.expectEqual(@as(usize, hfaFieldCount(rt)), hfaFieldCount(ct));
+}
+
+test "aarch64 comptimeStruct matches createStruct without a heap slice" {
+    try expectComptimeStruct(&.{}, null);
+    try expectComptimeStruct(&.{ .float32, .float32 }, null);
+    try expectComptimeStruct(&.{ .float32, .float32, .float32, .float32 }, null);
+    try expectComptimeStruct(&.{ .float64, .float64, .float64 }, null);
+    try expectComptimeStruct(&.{ .int32, .float64 }, null);
+    try expectComptimeStruct(&.{ .float32, .float32, .float32, .float32, .float32 }, null);
+    try expectComptimeStruct(&.{ .int32, .int32 }, .@"8");
+
+    // Nested HFAs flatten by size/alignment. The offset table would list the
+    // two pairs, which is not the four S registers.
+    const pair = comptime comptimeStruct(&.{ .float32, .float32 }, null);
+    const flat = comptimeStruct(&.{ pair, pair }, null);
+    try std.testing.expectEqual(common.Type.Class.sse, flat.class);
+    try std.testing.expectEqual(@as(usize, 4), hfaFieldCount(flat));
+    const mixed = comptimeStruct(&.{ .float64, pair }, null);
+    try std.testing.expectEqual(common.Type.Class.int, mixed.class);
 }
 
 test "aarch64 void trampoline bytes" {

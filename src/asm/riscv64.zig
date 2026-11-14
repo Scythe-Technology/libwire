@@ -839,11 +839,11 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
     };
 }
 
-pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
-    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
-
-    const offsets = try allocator.alloc(usize, fields.len);
-    errdefer allocator.free(offsets);
+fn layoutStruct(fields: []const common.Type, force_alignment: ?std.mem.Alignment, offsets: ?[]usize) error{PoorAlignment}!struct { common.Type, bool } {
+    if (fields.len == 0) return .{ .{ .size = 0, .alignment = .@"1" }, false };
+    if (offsets) |buf| {
+        std.debug.assert(buf.len == fields.len);
+    }
 
     const layout = layoutFields(fields, offsets);
     if (force_alignment) |forced| {
@@ -856,20 +856,71 @@ pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, f
     // Larger than two XLEN words: the pointer is passed, not the bytes.
     // FPCC field sizes are meaningless once the argument is a pointer.
     const by_ref = size > 16;
-    const field_sizes: ?[]const usize = if (!by_ref and layout.record_sizes) blk: {
-        const sizes = try allocator.alloc(usize, fields.len);
-        for (fields, 0..) |field, i| sizes[i] = field.size;
-        break :blk sizes;
-    } else null;
-
     return .{
-        .size = size,
-        .alignment = result_align,
-        .offsets = offsets,
-        .field_sizes = field_sizes,
-        .class = if (by_ref) .mem else layout.class,
-        .eightbytes = if (by_ref) .{} else layout.eightbytes,
+        .{
+            .size = size,
+            .alignment = result_align,
+            .offsets = offsets,
+            .class = if (by_ref) .mem else layout.class,
+            .eightbytes = if (by_ref) .{} else layout.eightbytes,
+        },
+        !by_ref and layout.record_sizes,
     };
+}
+
+pub fn createStruct(allocator: std.mem.Allocator, fields: []const common.Type, force_alignment: ?std.mem.Alignment) !common.Type {
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
+    const offsets = try allocator.alloc(usize, fields.len);
+    errdefer allocator.free(offsets);
+
+    var built = try layoutStruct(fields, force_alignment, offsets);
+    if (built.@"1") {
+        const sizes = try allocator.alloc(usize, fields.len);
+        errdefer allocator.free(sizes);
+
+        for (fields, 0..) |field, i| {
+            sizes[i] = field.size;
+        }
+
+        built.@"0".field_sizes = sizes;
+    }
+    return built.@"0";
+}
+
+fn fieldAlignment(fields: []const common.Type) std.mem.Alignment {
+    var alignment: std.mem.Alignment = .@"1";
+    for (fields) |field| alignment = alignment.max(field.alignment);
+    return alignment;
+}
+
+pub fn comptimeStruct(comptime fields: []const common.Type, comptime force_alignment: ?std.mem.Alignment) common.Type {
+    const natural = comptime fieldAlignment(fields);
+    if (force_alignment) |forced| {
+        if (@backingInt(forced) < @backingInt(natural))
+            @compileError("poor struct alignment");
+    }
+    if (fields.len == 0) return .{ .size = 0, .alignment = .@"1" };
+
+    comptime var offsets: [fields.len]usize = undefined;
+    comptime var sizes: [fields.len]usize = undefined;
+
+    comptime var built = layoutStruct(fields, force_alignment, &offsets) catch unreachable;
+
+    inline for (fields, 0..) |field, i| {
+        sizes[i] = field.size;
+    }
+
+    const storage = struct {
+        const static_offsets: [fields.len]usize = offsets;
+        const static_sizes: [fields.len]usize = sizes;
+    };
+
+    built.@"0".offsets = &storage.static_offsets;
+    if (built.@"1") {
+        built.@"0".field_sizes = &storage.static_sizes;
+    }
+    return built.@"0";
 }
 
 /// No offset table: `Type.array` has no allocator. `hfaFieldCount` recovers
@@ -1345,4 +1396,48 @@ test "riscv64 createStruct and createArray" {
     const doubled = createArray(pair, 2);
     try std.testing.expectEqual(common.Type.Class.int, doubled.class);
     try std.testing.expectEqual(@as(usize, 16), doubled.size);
+}
+
+fn expectComptimeStruct(comptime fields: []const common.Type, comptime force_alignment: ?std.mem.Alignment) !void {
+    const ct = comptimeStruct(fields, force_alignment);
+    const rt = try createStruct(std.testing.allocator, fields, force_alignment);
+    defer rt.free(std.testing.allocator);
+    try std.testing.expectEqual(rt.size, ct.size);
+    try std.testing.expectEqual(rt.alignment, ct.alignment);
+    try std.testing.expectEqual(rt.class, ct.class);
+    try std.testing.expectEqual(rt.eightbytes.low, ct.eightbytes.low);
+    try std.testing.expectEqual(rt.eightbytes.high, ct.eightbytes.high);
+    if (rt.offsets) |offs| {
+        try std.testing.expectEqualSlices(usize, offs, ct.offsets.?);
+    } else {
+        try std.testing.expect(ct.offsets == null);
+    }
+    if (rt.field_sizes) |sizes| {
+        try std.testing.expectEqualSlices(usize, sizes, ct.field_sizes.?);
+    } else {
+        try std.testing.expect(ct.field_sizes == null);
+    }
+    try std.testing.expectEqual(@as(usize, hfaFieldCount(rt)), hfaFieldCount(ct));
+}
+
+test "riscv64 comptimeStruct matches createStruct without a heap slice" {
+    try expectComptimeStruct(&.{}, null);
+    try expectComptimeStruct(&.{ .float32, .float32 }, null);
+    try expectComptimeStruct(&.{ .float64, .float64 }, null);
+    try expectComptimeStruct(&.{ .float32, .float32, .float32 }, null);
+    try expectComptimeStruct(&.{ .float32, .float32, .int32, .int32 }, null);
+    try expectComptimeStruct(&.{ .float64, .float64, .float64 }, null);
+    try expectComptimeStruct(&.{ .int64, .int64 }, null);
+    try expectComptimeStruct(&.{ .int32, .int32 }, .@"8");
+    try expectComptimeStruct(&.{ .float32, .float64 }, null);
+    try expectComptimeStruct(&.{ .float64, .float32 }, null);
+    try expectComptimeStruct(&.{ .float32, .int32 }, null);
+    try expectComptimeStruct(&.{ .int32, .float64 }, null);
+    try expectComptimeStruct(&.{ .float64, .int64 }, null);
+    try expectComptimeStruct(&.{ .uint8, .uint8 }, null);
+    try expectComptimeStruct(&.{.int8}, null);
+
+    const pair = comptime comptimeStruct(&.{ .float32, .float32 }, null);
+    try expectComptimeStruct(&.{pair}, null);
+    try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(comptimeStruct(&.{pair}, null)));
 }

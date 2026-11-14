@@ -5,6 +5,7 @@ const wire = @import("./lib.zig");
 pub const Type = struct {
     size: usize,
     alignment: std.mem.Alignment,
+    /// Field byte offsets. `createStruct` allocates the slice.
     offsets: ?[]const usize = null,
     class: Class = .int,
     /// SysV eightbyte classes, least-significant chunk first. Both `.none`
@@ -15,7 +16,7 @@ pub const Type = struct {
     eightbytes: Eightbytes = .{},
     /// Per-field byte sizes. Null on every backend except RISC-V FPCC pairs
     /// whose members are not `size / count` (`{f32,f64}` is 4 then 8, with
-    /// padding in the gap). `free` releases the slice.
+    /// padding in the gap). `createStruct` allocates the slice.
     field_sizes: ?[]const usize = null,
     /// Signed integer. Only sizes 1 and 2 change codegen: the C caller
     /// sign-extends those into the register. Size 4 stays a 32-bit move
@@ -79,5 +80,9 @@ pub const Type = struct {
 
     pub fn @"struct"(allocator: std.mem.Allocator, fields: []const Type, force_alignment: ?std.mem.Alignment) !Type {
         return wire.asmb.createStruct(allocator, fields, force_alignment);
+    }
+
+    pub fn comptimeStruct(comptime fields: []const Type, comptime force_alignment: ?std.mem.Alignment) Type {
+        return wire.asmb.comptimeStruct(fields, force_alignment);
     }
 };
