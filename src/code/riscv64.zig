@@ -1231,6 +1231,89 @@ test "riscv64 code classify f32 pair" {
     try expectPlace(again, 0, .{ .fp = .{ .base = 0, .n = 2 } });
 }
 
+test "riscv64 code classify wrapped fp aggregate is gpr" {
+    const allocator = std.testing.allocator;
+
+    const one = try rv.createStruct(allocator, &.{.float32}, null);
+    defer one.free(allocator);
+    const one_f64 = try rv.createStruct(allocator, &.{.float64}, null);
+    defer one_f64.free(allocator);
+    try expectPlace(classify(&.{one}, false), 0, .{ .fp = .{ .base = 0, .n = 1 } });
+    try expectPlace(classify(&.{one_f64}, false), 0, .{ .fp = .{ .base = 0, .n = 1 } });
+
+    const pair = try rv.createStruct(allocator, &.{ .float32, .float32 }, null);
+    defer pair.free(allocator);
+    const wrapped = try rv.createStruct(allocator, &.{pair}, null);
+    defer wrapped.free(allocator);
+    // Both floats ride in a0. fa0 would be one `fld` of the wrapper.
+    try expectPlace(classify(&.{wrapped}, false), 0, .{ .gp = .{ .base = 0, .n = 1 } });
+
+    const two_f64 = try rv.createStruct(allocator, &.{ .float64, .float64 }, null);
+    defer two_f64.free(allocator);
+    const wrapped_f64 = try rv.createStruct(allocator, &.{two_f64}, null);
+    defer wrapped_f64.free(allocator);
+    try expectPlace(classify(&.{wrapped_f64}, false), 0, .{ .gp = .{ .base = 0, .n = 2 } });
+
+    const triple = try rv.createStruct(allocator, &.{ .float32, .float32, .float32 }, null);
+    defer triple.free(allocator);
+    const wrapped_triple = try rv.createStruct(allocator, &.{triple}, null);
+    defer wrapped_triple.free(allocator);
+    try expectPlace(classify(&.{wrapped_triple}, false), 0, .{ .gp = .{ .base = 0, .n = 2 } });
+
+    const deeper = try rv.createStruct(allocator, &.{wrapped}, null);
+    defer deeper.free(allocator);
+    try expectPlace(classify(&.{deeper}, false), 0, .{ .gp = .{ .base = 0, .n = 1 } });
+
+    // `{ {f32} }` is an aggregate member, not a bare f32, so it is a0.
+    const wrapped_one = try rv.createStruct(allocator, &.{one}, null);
+    defer wrapped_one.free(allocator);
+    try expectPlace(classify(&.{wrapped_one}, false), 0, .{ .gp = .{ .base = 0, .n = 1 } });
+}
+
+fn loadReturnBytes(allocator: std.mem.Allocator, ty: common.Type) ![]u8 {
+    var c = try Code.init(allocator, &.{.pointer}, ty);
+    defer c.deinit();
+    const loaded = try c.load(c.param(0), 0, ty);
+    return c.compileAlloc(allocator, loaded);
+}
+
+test "riscv64 code wrapped f32 pair returns in a0" {
+    const allocator = std.testing.allocator;
+    const pair = try rv.createStruct(allocator, &.{ .float32, .float32 }, null);
+    defer pair.free(allocator);
+    const wrapped = try rv.createStruct(allocator, &.{pair}, null);
+    defer wrapped.free(allocator);
+
+    const wrapped_bytes = try loadReturnBytes(allocator, wrapped);
+    defer allocator.free(wrapped_bytes);
+    const int_bytes = try loadReturnBytes(allocator, .int64);
+    defer allocator.free(int_bytes);
+    const fp_bytes = try loadReturnBytes(allocator, .float64);
+    defer allocator.free(fp_bytes);
+    const flat_bytes = try loadReturnBytes(allocator, pair);
+    defer allocator.free(flat_bytes);
+
+    // One GPR, the same sequence as an i64. Not fa0, and not the flat pair's fa0/fa1.
+    try std.testing.expectEqualSlices(u8, int_bytes, wrapped_bytes);
+    try std.testing.expect(!std.mem.eql(u8, fp_bytes, wrapped_bytes));
+    try std.testing.expect(!std.mem.eql(u8, flat_bytes, wrapped_bytes));
+
+    const two_f64 = try rv.createStruct(allocator, &.{ .float64, .float64 }, null);
+    defer two_f64.free(allocator);
+    const wrapped_f64 = try rv.createStruct(allocator, &.{two_f64}, null);
+    defer wrapped_f64.free(allocator);
+    const two_i64 = try rv.createStruct(allocator, &.{ .int64, .int64 }, null);
+    defer two_i64.free(allocator);
+    const wide_bytes = try loadReturnBytes(allocator, wrapped_f64);
+    defer allocator.free(wide_bytes);
+    const wide_int = try loadReturnBytes(allocator, two_i64);
+    defer allocator.free(wide_int);
+    const wide_fp = try loadReturnBytes(allocator, two_f64);
+    defer allocator.free(wide_fp);
+    try std.testing.expectEqualSlices(u8, wide_int, wide_bytes);
+    try std.testing.expect(!std.mem.eql(u8, wide_fp, wide_bytes));
+}
+
 test "riscv64 code classify ninth f64 is fp_in_gp" {
     var args: [9]common.Type = undefined;
     @memset(&args, .float64);

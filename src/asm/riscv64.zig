@@ -779,10 +779,6 @@ fn isIntScalar(ty: common.Type) bool {
 fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
     var cursor: usize = 0;
     var alignment: std.mem.Alignment = .@"1";
-    var uniform = fields.len > 0;
-
-    const elem_size = if (fields.len > 0) fields[0].size else 0;
-    const elem_class: common.Type.Class = if (fields.len > 0) fields[0].class else .int;
 
     for (fields, 0..) |field, i| {
         alignment = alignment.max(field.alignment);
@@ -793,14 +789,11 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
         }
 
         cursor += field.size;
-
-        if (field.class != elem_class or field.size != elem_size) {
-            uniform = false;
-        }
     }
 
-    // LP64D: one or two FP reals, sizes may differ, go in fa registers.
-    // A nested aggregate counts as one member and is not flattened.
+    // LP64D: one or two hardware FP reals, sizes may differ, go in fa
+    // registers. A nested aggregate is one member (`isFpScalar` is false
+    // when `offsets != null`) and is not flattened into those registers.
     if (fields.len == 2 and isFpScalar(fields[0]) and isFpScalar(fields[1])) {
         const padded = cursor != fields[0].size + fields[1].size;
         return .{
@@ -830,7 +823,8 @@ fn layoutFields(fields: []const common.Type, offsets: ?[]usize) Aggregate {
             };
         }
     }
-    const hfa = uniform and fields.len >= 1 and fields.len <= 2 and elem_class == .sse;
+
+    const hfa = fields.len == 1 and isFpScalar(fields[0]);
 
     return .{
         .cursor = cursor,
@@ -1315,6 +1309,19 @@ test "riscv64 createStruct and createArray" {
     try std.testing.expectEqual(@as(usize, 16), two_f64.size);
     try std.testing.expectEqual(@as(usize, 2), hfaFieldCount(two_f64));
 
+    // One bare hardware real is one fa register, even inside a struct.
+    const one_f32 = try createStruct(allocator, &.{.float32}, null);
+    defer one_f32.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.sse, one_f32.class);
+    try std.testing.expectEqual(@as(usize, 4), one_f32.size);
+    try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(one_f32));
+
+    const one_f64 = try createStruct(allocator, &.{.float64}, null);
+    defer one_f64.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.sse, one_f64.class);
+    try std.testing.expectEqual(@as(usize, 8), one_f64.size);
+    try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(one_f64));
+
     // A third float is past the LP64D pair, so this stays integer even though
     // the bytes still fit in two XLEN words.
     const three = try createStruct(allocator, &.{ .float32, .float32, .float32 }, null);
@@ -1367,11 +1374,45 @@ test "riscv64 createStruct and createArray" {
     try std.testing.expectEqual(common.Type.Class.mem, big.class);
     try std.testing.expectEqual(@as(usize, 24), big.size);
 
-    // The nested HFA is one member. Flattening it would report two registers.
+    // A nested FP aggregate is one integer member. Same size as the inner
+    // pair, but not an HFA: the bits stay in GPRs. Flattening would report
+    // two fa registers; treating the member's `.sse` class as one real
+    // would `fld` all 8 bytes into fa0.
     const nested = try createStruct(allocator, &.{pair}, null);
     defer nested.free(allocator);
-    try std.testing.expectEqual(common.Type.Class.sse, nested.class);
+    try std.testing.expectEqual(common.Type.Class.int, nested.class);
+    try std.testing.expectEqual(@as(usize, 8), nested.size);
+    try std.testing.expectEqual(@as(usize, 1), nested.offsets.?.len);
+    try std.testing.expect(nested.field_sizes == null);
+    try std.testing.expectEqual(common.Type.Eightbyte.none, nested.eightbytes.low);
+    try std.testing.expectEqual(common.Type.Eightbyte.none, nested.eightbytes.high);
     try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(nested));
+
+    const nested_f64 = try createStruct(allocator, &.{two_f64}, null);
+    defer nested_f64.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.int, nested_f64.class);
+    try std.testing.expectEqual(@as(usize, 16), nested_f64.size);
+    try std.testing.expectEqual(@as(usize, 1), nested_f64.offsets.?.len);
+    try std.testing.expect(nested_f64.field_sizes == null);
+
+    const nested_three = try createStruct(allocator, &.{three}, null);
+    defer nested_three.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.int, nested_three.class);
+    try std.testing.expectEqual(@as(usize, 12), nested_three.size);
+    try std.testing.expectEqual(@as(usize, 1), nested_three.offsets.?.len);
+
+    // `{ {f32} }` matches a bare f32 in size and alignment, but the member
+    // has offsets, so it is an aggregate and stays in a GPR.
+    const wrapped_one = try createStruct(allocator, &.{one_f32}, null);
+    defer wrapped_one.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.int, wrapped_one.class);
+    try std.testing.expectEqual(@as(usize, 4), wrapped_one.size);
+
+    const deeper = try createStruct(allocator, &.{nested}, null);
+    defer deeper.free(allocator);
+    try std.testing.expectEqual(common.Type.Class.int, deeper.class);
+    try std.testing.expectEqual(@as(usize, 8), deeper.size);
+    try std.testing.expectEqual(@as(usize, 1), deeper.offsets.?.len);
 
     try std.testing.expectError(error.PoorAlignment, createStruct(allocator, &.{.int64}, .@"4"));
 
@@ -1437,7 +1478,34 @@ test "riscv64 comptimeStruct matches createStruct without a heap slice" {
     try expectComptimeStruct(&.{ .uint8, .uint8 }, null);
     try expectComptimeStruct(&.{.int8}, null);
 
+    try expectComptimeStruct(&.{.float32}, null);
+    try expectComptimeStruct(&.{.float64}, null);
+
     const pair = comptime comptimeStruct(&.{ .float32, .float32 }, null);
+    const two_f64 = comptime comptimeStruct(&.{ .float64, .float64 }, null);
+    const triple = comptime comptimeStruct(&.{ .float32, .float32, .float32 }, null);
+    const one_f32 = comptime comptimeStruct(&.{.float32}, null);
     try expectComptimeStruct(&.{pair}, null);
-    try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(comptimeStruct(&.{pair}, null)));
+    try expectComptimeStruct(&.{two_f64}, null);
+    try expectComptimeStruct(&.{triple}, null);
+    try expectComptimeStruct(&.{one_f32}, null);
+
+    const wrapped = comptime comptimeStruct(&.{pair}, null);
+    try std.testing.expectEqual(common.Type.Class.int, wrapped.class);
+    try std.testing.expectEqual(@as(usize, 8), wrapped.size);
+    try std.testing.expectEqual(@as(usize, 1), hfaFieldCount(wrapped));
+    const wrapped_f64 = comptime comptimeStruct(&.{two_f64}, null);
+    try std.testing.expectEqual(common.Type.Class.int, wrapped_f64.class);
+    try std.testing.expectEqual(@as(usize, 16), wrapped_f64.size);
+    const wrapped_triple = comptime comptimeStruct(&.{triple}, null);
+    try std.testing.expectEqual(common.Type.Class.int, wrapped_triple.class);
+    try std.testing.expectEqual(@as(usize, 12), wrapped_triple.size);
+    const wrapped_one = comptime comptimeStruct(&.{one_f32}, null);
+    try std.testing.expectEqual(common.Type.Class.int, wrapped_one.class);
+    try std.testing.expectEqual(@as(usize, 4), wrapped_one.size);
+
+    const deeper = comptime comptimeStruct(&.{wrapped}, null);
+    try std.testing.expectEqual(common.Type.Class.int, deeper.class);
+    try std.testing.expectEqual(@as(usize, 8), deeper.size);
+    try expectComptimeStruct(&.{deeper}, null);
 }
